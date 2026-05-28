@@ -58,105 +58,158 @@ Then not only are the slices restricted, but your iterator also needs to be rest
 ### Models of lifetimes
 
 In Swift, we enforce safe access to scoped resources using [non-escapable types][SE-0446].
-Swift currently implements a straightforward model for non-escapable types based on value dependencies.
-This is sufficient to allow a lot of basic types to be defined, like the `Span` and `MutableSpan` types added by [SE-0447][] and [SE-0467][], and these types have seen substantial practical use.
-It is, of course, good that we've been able to deliver these features, and the discussion about fundamental models that follows is not meant to suggest that we've made any serious missteps there.
-The most important use patterns of non-escapable types, for most developers, fit within a relatively simple subset that doesn't look too different in different models of lifetimes.
-But I do think there are major problems with the value-dependency model, problems that we are running into more and more as we try to build out abstractions over non-escapable types, like allowing the element types of pointers and [iterable containers][SE-0516] to be `~Escapable`.
-And I am particularly concerned that the model makes it too easy to misunderstand the generalizations we're looking at, potentially leading us to make the *wrong* generalizations.
+There's a natural intuition for what it means to have a value of a non-escapable type: the value cannot be used outside of some scope.
+That scope is usually clear from context, and intuitive reasoning leads to a set of rules that any reasonable language feature for scoped resources would need to follow.
+For example, if you have a parameter of non-escapable type, you cannot assign that value to a global variable, or to any location where you can no longer reason about whether the value has escaped.
 
-My concrete proposal in this document is that Swift should switch to a type-based model for the lifetime restrictions on non-escapable types. The third section of the document lays out the basic requirements on the model as I see them. I believe that we can design a syntax for describing lifetime relationships on top of that model that avoids the weaknesses of the Rust syntax while still permitting a straightforward and high-performance dynamic erasure semantics.
+But you cannot design language features by enumerating every code pattern that would use the feature and deciding intuitively how each should work.
+Instead, you define general rules, which you can then validate against your intuition as part of the design process.
+These general rules are called the formal model underlying the feature.
+The core ideas of the formal model are predominantly responsible for determining how the feature works in the language.
+The rest of the language design of the feature can usually be thought of as relatively superficial tweaks on top of those core ideas.[^5][^6]
+
+[^5]: The rule of exclusivity defined by [SE-0176][] has an example of such a tweak.
+      The general model of exclusivity is that, whenever you use a variable, there is a corresponding access scope, and conflicting access scopes (e.g. two mutations of the same variable) cannot overlap.
+      But there is a small exception to the model that permits overlapping accesses to different stored properties of the same variable.
+
+[^6]: Another example is the addition of [region-based isolation][SE-0414] to the core model of non-sendable types.
+      This was a much deeper change, and one with significantly wider implications to the core feature.
+      Even so, it had to be built in order to fit on top of the existing rules.
+      Core model replacements are rarely strictly additive in this way, which is a large part of why they are difficult to do retroactively.
+
+It is my contention that the current formal model we use for scope restrictions in Swift is not what it needs to be.
+The current interpretation of non-escapable types makes it difficult to correctly handle certain kinds of abstraction over scoped resources because the scope restrictions do not propagate properly through types.
+(This has some other knock-on effects.)
+I believe that the limitations we've been imposing on non-escapable types up until recently have given us a window in which it still remains acceptable to change the model.
+But we will close that window very quickly if we start adding generalizations over non-escapable types to the standard library.
+We will regret doing so.
+
+Now, the current model works fine for many simple, useful code patterns.
+We do not need to withdraw any of the library features we've already released using non-escapable types.
+All we need to do is continue to disallow certain kinds of generalization over non-escapable types until we can introduce the right model for them.
 
 ## The value-dependency model of scope restrictions
 
-The Swift compiler has always performed a basic data-flow and control-flow analysis of every function it compiles.
-This is necessary in order to implement a number of language rules, including the rules for [static exclusivity][SE-0176] and the detection of constant integer overflow.
-This naturally gives the compiler the ability to directly reason about certain scopes within the program, such as the exclusivity scopes of accesses to local variables.
+Swift's current formal model for scope restrictions is based on lifetime dependencies between abstract values.
 
-As part of its normal work, the compiler has also always needed to understand certain dependencies between values.
-For example, the value of a stored property of a struct is dependent on the value of the containing struct; if you destroy the containing value, you destroy the property as well.
-Moreover, this applies recursively: the address of a stored property of a class reference that was borrowed out of a stored property of a struct is ultimately dependent on the original containing struct.
+An abstract value represents a computation that is performed (implicitly or explicitly) as part of evaluating a function.
+For example, if the function contains a function call, there is an abstract value corresponding to the result of that call.
+At every point in a local variable or `inout` parameter's scope, an abstract value can be determined that represents how the value of the variable at that point was computed.
+There are special abstract values representing "computations" such as parameters, initial values of `inout` parameters, final values of `inout` call arguments, and values that are computed differently on different control flow paths.
 
-In this world, non-escapable values can be seen as simply another way to carry a dependency.
-A function signature indicates the dependency relationships created by the call.
-For example, in this API:
+Every abstract value has a set of root lifetime dependencies.
+These dependencies are either (1) specific local access scopes or (2) "root" abstract values such as parameters or initial values of `inout` parameters.
+Abstract values of escapable type, such as `Int`s, generally have no lifetime dependencies, superseding all other rules.
+Abstract values that represent most "primitive" computations, like projecting the address of a struct stored property, generally just carry the lifetime dependencies of their data dependencies.
+For example, the result of reading a stored property of a struct value generally has the same lifetime dependencies as the struct value.
+Similarly, the result of a control-flow-merge computation carries the union of the dependencies of all of the different possible inputs.
+However, call results and final `inout` call argument values are special: they carry dependencies based on the dependency signature of the called function.
 
-```swift
-extension Array {
-  func returnASpan() -> Span<Element>
-}
-```
+Every function has a dependency signature as part of its type.
+This signature describes the dependencies of the results, including the final abstract values of any `inout` call arguments.
+Dependencies in a function dependency signature are sets of any of:
+- the access scope of a function parameter, if it is a `borrowing` or `inout` parameter,
+- the abstract value of a function parameter, if it has a non-escapable type, or
+- the initial abstract value of an `inout` parameter, if it has a non-escapable type.
+When determining dependencies for a call result or final `inout` call argument argument value, these rules are applied to the lifetime dependencies of the corresponding arguments.
 
-the result value is assumed to depend on the scope of the borrow of the `self` argument to the method.
+For example, if the dependency signature says that the call result is dependent on the abstract value of parameter #4 and the initial value of `inout` parameter #6, then the lifetime dependencies of the call result abstract value are the union of the lifetime dependencies of the abstract value passed as call argument #4 and the lifetime dependencies of the current abstract value (at the point of the call) of the variable passed as `inout` argument #6.
 
-This is the basis of Swift's current support for non-escapable values.
-Put simply, the lifetime checker reverses the chain of dependencies to determine the scopes that a non-escapable value is dependent on, then verifies that the value is only used within those scopes.[^5]
+The formal model then comes down to two restrictions:
 
-[^5]:
-  The actual implementation is not nearly as easy as this might make it sound.
-  For one, the analysis sometimes has to be performed even for abstract values that are not naturally represented as values in Swift's SIL internal representation.
-  I believe Swift uses techniques similar to [memory SSA](https://llvm.org/docs/MemorySSA.html) or [SSI](https://publications.csail.mit.edu/lcs/pubs/pdf/MIT-LCS-TR-801.pdf) to bridge this gap.
+1. Every use of a value that has a lifetime dependency on an access scope must occur within that access scope.
+   (If the value has dependencies on multiple scopes, the use must occur within all of the scopes.)
 
-This analysis can be described with a formal model that's essentially a kind of directed graph.
-The nodes of the graph are different values in the local data flow of a function, and the edges are the dependency relationships between those values.
+2. The lifetime dependencies of abstract values corresponding to function results must be a subset of the corresponding dependencies declared in the function's dependency signature.
 
-### Example of the value-dependency model in action
+For example, suppose that the dependency signature for the current function says that the call result is dependent on the abstract value of parameter #4 and the initial value of `inout` parameter #6.
+Consider the lifetime dependencies of the abstract value that is returned by the function.
+It's okay if these dependencies are the empty set, or just the abstract value of parameter #4.
+But if the dependencies include something not in the declared set, that is an error.
 
-The following example is not currently supported in Swift, and the IR is not exactly what the SIL would look like, but it illustrates the model well:
+### History of the value-dependency model
 
-```swift
-var numbers = [1,2,3,4]
-var spans = [Span<Int>]()
-spans.append(numbers.span)
-print(spans[0])
-```
+This model arises naturally as an extension of several things that are already built into Swift.
+Almost all of the rules for abstract values defined above fall out automatically from a basic data flow analysis of the function body.[^7]
+This analysis is performed unconditionally by the compiler and is required for a lot of existing language features and basic optimizations.
+Similarly, the primitive value dependencies introduced by things like projecting out property addresses are very important to optimization, and the compiler has extensive support for inspecting and traversing these operations.
+The lifetime dependency set can be computed with a fixed-point analysis on the function's data flow graph.
+There's a good reason we started with this model.
 
-The nullary `Array` initializer produces a value with no dependencies, so `spans_1` has no dependencies:
+[^7]: Compiler developers generally refer to this analysis as putting the function into [static single assignment][SSA] form.
+      Swift's "SIL" SSA representation does not normally model the special abstract values described above for `inout` parameters and arguments, though.
 
-```text
-  %spans_1 = apply Array.init()
-  // %spans_1 depends on nothing
-```
+(This is not meant to downplay the amount of work that's gone into implementing the current feature.
+The compiler does some very impressive things, especially around shrinking and extending scopes in order to avoid unnecessary violations of the model's restrictions.
+And it's worth nothing that almost all of that work would still be necessary if Swift switched to a different language model.
+The analysis parts of it would just get consumed in a different way, and the rewriting parts should be exactly the same.)
 
-`Array.span` requires the current value of `self` to be borrowed and returns a span that depends on the scope of that borrow:
+### Problems with the value-dependency model
 
-```text
-  %borrowed_numbers = begin_borrow %numbers
-  // %borrowed_numbers depends on nothing but is itself a scope
+#### Scope restrictions cannot be expressed on types
 
-  %span = apply Array.span(%borrowed_numbers)
-  // %span depends on %borrowed_numbers
-```
+The biggest problem with the value-dependency model is that scope restrictions are never carried directly abstractly by types.
+Scope restrictions can only ever be applied to specific values, like the parameters or results of a function, and different values of the same type can always have different dependencies.
+This makes it impossible to write a scope restriction in an abstract type position, such as a generic argument or an associated type.
+And that makes it impossible to express a lot of things, like collections of non-escapable values with a specific scope restriction.
+When you try, you end up with lifetime dependencies that are wildly conservative, often uselessly so.
+And ultimately that means that many generic abstractions that should be perfectly suitable for non-escapable types end up being impossible to write.
 
-`Array.append` adds a dependency on its value argument to its `self` parameter:
+Consider the `Iterable` protocol proposed by [SE-0516][].
+The protocol defines an `IterableIterator` associated type which is allowed (actually expected) to be non-escapable.
+It also defines an `Element` associated type, which we would also like to allow to be non-escapable in order to support collections of non-escapable values.
 
-```text
-  %spans_2 = apply Array.append(%spans_1, %span)
-  // %spans_2 has all the dependencies of %spans_1, plus a dependency on %span;
-  // so it depends on %span, and therefore recursively on %borrowed_numbers
-```
+Now, the protocol requires an `Iterable` value to have a `makeIterableIterator` method.
+Whenever you call this method, you must borrow the collection, and the iterator it returns should only be used within the scope of that borrow.
+The value-dependency model has no problem expressing this scope restriction.
+Note that different calls will be restricted to different borrow scopes.
+Nothing about the type of the collection has anything to say about the scope of the iterator, nor should it.
 
-`Array.subscript` requires the current value of `self` to be borrowed.
-This borrow introduces a new scope into the function.
-However, the result of `Array.subscript` has what the lifetimes proposal would call a "copy" dependency on `self`.
-This means that the value has the same dependencies as the current value of `self`, not on the scope of the borrow of `self`:
+The iterator thus produced is now required to have a `nextSpan` method that returns back a `Span<Element>`, and this is where the model runs into a problem.
+What is the scope restriction of the elements of this span?
+The value-dependency model can only express this in terms of the lifetime of something passed in to the method.
+Most likely, I expect the scope restriction to be the same as the scope restriction on the elements of the original collection.
+But the model has no way to talk about that; there is no concept in the model of the scope restriction on the elements of the collection.
+There are only lifetime dependencies on the collection value as a whole.[^8]
+The model's natural interpretation of the signature of `nextSpan`, given a non-escapable `Element` type, is that the scope restriction of the element is the same as the scope restriction of the span itself: the scope of the `inout` access made for the call to `nextSpan`.
+That is, `nextSpan` is permitted not only to materialize elements into a temporary array, but to actually construct the values in that array with a novel temporary scope restriction.
+This means that the caller of `nextSpan` is incredibly constrained.
+A `for` loop using this protocol to iterate a collection of non-escapable values — even if they're fully copyable — cannot persist a value between iterations of the loop.
 
-```text
-  %index = Int(0)
-  %borrowed_spans2 = begin_borrow %spans2
-  %subscript_span = apply Array.subscript(%borrowed_spans2, %index)
-  end_borrow %borrowed_spans2
-  // %subscript_span has the same dependencis as %span2, which is to say,
-  // it depends only on %span (and therefore recursively on %borrowed_numbers).
-  // Note that it does not depend on %borrowed_spans2 because this is a copy
-  // dependency.
-```
+[^8]: There has been a small amount of exploration of the idea of having multiple "nested" lifetimes associated with a given abstract value, specifically with the goal of addressing this issue.
+      In some cases, that might help.
+      It would not help here, because that nested lifetime structure would only be known for a concrete conforming type and cannot be referenced in the abstract protocol requirement.
+      So the protocol requirement is stuck making the extremely pessimistic lifetime statement I describe here.
 
-`print` uses that subscript result in a way that can't be locally analyzed, so the lifetime checker has to verify that the use stays within the scopes that the value depends on.
-In this case, that scope is just `%borrowed_numbers`.
-So the lifetime checker has to make sure that the `%borrowed_numbers` scope hasn't been ended already.
-It can try to do that by extending the borrow scope to at least this point in the function.
-Since there are no intervening mutating accesses to `numbers`, this succeeds without causing an exclusivity conflict, and the function should be accepted.
+Now, one could argue that this is just a more general signature.
+It is possible to imagine an abstract value producer that would benefit from the flexibility to synthesize non-escapable elements bound to the iteration, although it's quite a bit of a stretch.
+Perhaps a protocol like `Iterable` really should aim to allow that.
+We've already discussed the possible need for refinements of `Iterable` that give stronger lifetime guarantees about the spans returned; maybe this fits into that.
+
+But the same expressivity problem would still affect all of these less-abstract protocols.
+Suppose there's a `Container` protocol that represents a concrete, in-memory collection, and it mandates a `ContainerIterator` for which `nextSpan()` returns a `Span` constrained not to the scope of the `nextSpan` call, but to the lifetime of the iterator itself (presumably the lifetime of the borrow of the original collection).
+We can still ask, what is the lifetime of the elements?
+The protocol is still allowing it to be as narrow as the borrow of the original collection, but that's still over-constrained: the elements are necessarily usable in some broader scope than just this specific borrow of the container holding them.
+In theory, the protocol is allowing them to be synthesized as part of the `makeIterator` call, because it has no ability to associate a scope restriction specifically with the element values.[^9]
+There's no obvious implementation which could take advantage of that flexibility, since (barring something reference-type-ish) the `makeIterator` call does not have the ability to mutate anything to set that up, but nonetheless, that's all that the protocol would guarantee.
+
+[^9]: It may be possible under a nested lifetime approach to allow the nested lifetime to also be abstracted over in the protocol and named in protocol requirements.
+      However, conformances are associated with types, not values.
+      This idea would need to be explored further, but I believe it may still require a major model shift towards type-based scope restrictions.
+
+Could we wait to solve that problem?
+We could ship `Iterable` over non-escapable elements using this more general, value-dependency-friendly signature, then use a type-based design for the more cncrete `Container` protocols.
+Unfortunately, that would come with some very foundational problems.
+The `Element` associated type for `Iterable` would have to be an "abstract" non-escapable type, like `IterableIterator` is, with its scope restrictions left to be filled in from context.
+But the `Element` associated type for `Container` would be different, carry its scope restrictions explicitly.
+It's really unclear how that would work.
+Not only are those different types with very different interpretations when used, but they're differently-*kinded* types.
+It's very likely that the resulting model would be a huge mess both for users and for the implementation.
+
+
+
+<!-- WIP, editing point -->
+
 
 ### Problems with the value-dependency model
 
@@ -439,8 +492,26 @@ An alternative approach would be to determine the inequalities from call sites i
 
 
 [SE-0176]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0176-enforce-exclusive-access-to-memory.md
+[SE-0414]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0414-region-based-isolation.md
 [SE-0446]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0446-non-escapable.md
 [SE-0447]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0447-span-access-shared-contiguous-storage.md
 [SE-0467]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0467-MutableSpan.md
 [SE-0516]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0516-borrowing-sequence.md
 [SE-0519]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0519-ref-mutableref-types.md
+[SSA]: https://en.wikipedia.org/wiki/Static_single-assignment_form
+
+
+
+
+
+
+
+
+Swift currently implements a straightforward model for non-escapable types based on value dependencies.
+This is sufficient to allow a lot of basic types to be defined, like the `Span` and `MutableSpan` types added by [SE-0447][] and [SE-0467][], and these types have seen substantial practical use.
+It is, of course, good that we've been able to deliver these features, and the discussion about fundamental models that follows is not meant to suggest that we've made any serious missteps there.
+The most important use patterns of non-escapable types, for most developers, fit within a relatively simple subset that doesn't look too different in different models of lifetimes.
+But I do think there are major problems with the value-dependency model, problems that we are running into more and more as we try to build out abstractions over non-escapable types, like allowing the element types of pointers and [iterable containers][SE-0516] to be `~Escapable`.
+And I am particularly concerned that the model makes it too easy to misunderstand the generalizations we're looking at, potentially leading us to make the *wrong* generalizations.
+
+My concrete proposal in this document is that Swift should switch to a type-based model for the lifetime restrictions on non-escapable types. The third section of the document lays out the basic requirements on the model as I see them. I believe that we can design a syntax for describing lifetime relationships on top of that model that avoids the weaknesses of the Rust syntax while still permitting a straightforward and high-performance dynamic erasure semantics.
