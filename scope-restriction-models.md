@@ -93,17 +93,22 @@ All we need to do is continue to disallow certain kinds of generalization over n
 Swift's current formal model for scope restrictions is based on lifetime dependencies between abstract values.
 
 An abstract value represents a computation that is performed (implicitly or explicitly) as part of evaluating a function.
-For example, if the function contains a function call, there is an abstract value corresponding to the result of that call.
+For example, if the function contains a function call, there is an abstract value corresponding to the return value of that call.
 At every point in a local variable or `inout` parameter's scope, an abstract value can be determined that represents how the value of the variable at that point was computed.
 There are special abstract values representing "computations" such as parameters, initial values of `inout` parameters, final values of `inout` call arguments, and values that are computed differently on different control flow paths.
 
-Every abstract value has a set of root lifetime dependencies.
+Every abstract value has a set of lifetime dependencies.
 These dependencies are either (1) specific local access scopes or (2) "root" abstract values such as parameters or initial values of `inout` parameters.
-Abstract values of escapable type, such as `Int`s, generally have no lifetime dependencies, superseding all other rules.
-Abstract values that represent most "primitive" computations, like projecting the address of a struct stored property, generally just carry the lifetime dependencies of their data dependencies.
-For example, the result of reading a stored property of a struct value generally has the same lifetime dependencies as the struct value.
-Similarly, the result of a control-flow-merge computation carries the union of the dependencies of all of the different possible inputs.
-However, call results and final `inout` call argument values are special: they carry dependencies based on the dependency signature of the called function.
+
+The way that an abstract value is computed determines the relationship between its lifetime dependencies and those of the abstract values that it was computed from:
+- Abstract values of escapable type, such as `Int`s, generally have no lifetime dependencies, superseding all other rules.
+- Abstract values for parameters (including initial values of `inout` parameters) are roots and just have themselves as lifetime dependencies.
+- Abstract values for most other computations generally have the same lifetime dependencies as their data dependencies.
+  For example, an abstract value representing the read of a non-escapable stored property of a struct value has the same lifetime dependencies as the original struct value.
+  Similarly, the result of a control-flow-merge computation carries the union of the dependencies of all of the different possible inputs.
+- However, call results (return values and final `inout` argument values) are special: their dependencies are determined based on the dependency signature of the called function.
+  This is described in more detail below.
+The abstract value's set of lifetime dependencies is the solution of this system of set relationships.
 
 Every function has a dependency signature as part of its type.
 This signature describes the dependencies of the results, including the final abstract values of any `inout` call arguments.
@@ -131,9 +136,9 @@ But if the dependencies include something not in the declared set, that is an er
 
 This model arises naturally as an extension of several things that are already built into Swift.
 Almost all of the rules for abstract values defined above fall out automatically from a basic data flow analysis of the function body.[^7]
-This analysis is performed unconditionally by the compiler and is required for a lot of existing language features and basic optimizations.
-Similarly, the primitive value dependencies introduced by things like projecting out property addresses are very important to optimization, and the compiler has extensive support for inspecting and traversing these operations.
-The lifetime dependency set can be computed with a fixed-point analysis on the function's data flow graph.
+This analysis is automatically performed by the compiler for every function and is required for a lot of existing language features and basic optimizations.
+Similarly, the primitive value dependencies introduced by things like projecting out property addresses are very important to optimization, and the compiler has extensive support for working with the data dependencies introduced by these operations.
+Using these tools, the lifetime dependency set of any particular abstract value can be computed by just finding the fixed point of the system of set inequalities described above for the abstract value.
 There's a good reason we started with this model.
 
 [^7]: Compiler developers generally refer to this analysis as putting the function into [static single assignment][SSA] form.
@@ -198,17 +203,184 @@ There's no obvious implementation which could take advantage of that flexibility
       This idea would need to be explored further, but I believe it may still require a major model shift towards type-based scope restrictions.
 
 Could we wait to solve that problem?
-We could ship `Iterable` over non-escapable elements using this more general, value-dependency-friendly signature, then use a type-based design for the more cncrete `Container` protocols.
+We could release `Iterable` over non-escapable elements using this more general, value-dependency-friendly signature, then use a type-based design for the more cncrete `Container` protocols.
 Unfortunately, that would come with some very foundational problems.
 The `Element` associated type for `Iterable` would have to be an "abstract" non-escapable type, like `IterableIterator` is, with its scope restrictions left to be filled in from context.
 But the `Element` associated type for `Container` would be different, carry its scope restrictions explicitly.
 It's really unclear how that would work.
 Not only are those different types with very different interpretations when used, but they're differently-*kinded* types.
-It's very likely that the resulting model would be a huge mess both for users and for the implementation.
+It seems likely that permitting this mismatch, where `Element` can have different interpretations in different contexts, would be a huge mess at every level, from the implementation up to the user-facing design.
 
+#### Conflation of different scope restrictions
 
+This is closely related to the previous point.
 
-<!-- WIP, editing point -->
+The current value-dependency model does not have the ability to distinguish different kinds of lifetime dependency.
+This is unfortunate because values may naturally have scope restrictions for multiple independent reasons.
+
+Consider a `Span` of non-escapable values.
+There is a natural scope restriction associated with the borrow of array that the span refers to.
+The elements stored in that array also came from some scope, almost certainly a different scope.
+So the scope restrictions are almost certainly different.
+But in the value-dependency model, the span value must have the union of those dependencies, and so much any element extracted from it.
+Putting the value into the span and then taking it out again has unavoidably lost information.
+This greatly restricts what can be done with the element.
+
+For example, suppose that you're writing an algorithm that works on a `Span` of values.
+Your algorithm naturally wants to filter and rearrange the elements as part of its operation, but it can't modify the original span, and you don't want to pay to copy the whole thing (if you even can).
+However, you can efficiently make a scratch array to hold `Ref`s to the interesting elements, since copying around a `Ref`s doesn't require copying its referent.
+When you pull those `Ref`s originally out of the `Span`, they start out with the same scope restriction.
+But if the scratch array is itself non-escapable --- for example, if it's temporary memory created by `withTemporaryAllocation`, a very efficient choice --- then any `Ref` pulled out of it will also carry a dependency on it.
+That means Swift can't let you just return that `Ref` from your algorithm, even though there's no real-world problem with doing so.
+
+There's an especially important special case of this: some values of types that are generally non-escaping actually do not require any dependencies at all.
+A global constant can be safely borrowed for a scope that covers the entire duration of the program.
+It can be useful to create collections of values like that, like arrays of statically-allocated strings.
+If those collections can also be generated as global constants, then great, those collection values need no dependencies.
+But if not, and the collection needs to be temporary, then the value-dependency model has no way to separate the global-ness of the elements from that temporary-ness.
+
+This problem also has a huge impact on the ability of higher-order algorithms to usefully work with non-escaping values.
+Consider a generic algorithm like the following, which calls a function for each element in a collection and returns the first non-`nil` result:
+
+```swift
+extension Collection where Element: ~Copyable & ~Escapable {
+  func firstReturning<R>(operation: (borrowing Element) -> R?) -> R?
+    where R: ~Copyable & ~Escapable
+}
+```
+
+Here the algorithm has been generalized to permit a return value of arbitrary type.[^10]
+Unfortunately, there's a problem with this.
+The `operation` closure is a non-escaping function, as it should be, since `firstReturning` doesn't plan to escape it.
+But that means that, when we call it within `firstReturning`, its return value is naturally going to gain a dependency on the closure.
+This makes sense: after all, the closure certainly could capture something non-escapable and return a value dependent on it.
+The dependency is necessary in order to conservatively model that possibility.
+On some level, that's fine; it just means that `firstReturning` has to be declared with a dependency signature that says that the return value gains a dependency on `operation`.
+But now clients are really restricted: the closure has to be kept around at least as long as the result of `firstReturning` is being used.
+So you could not, for example, use `firstReturning` to implement a function like the following:
+
+```swift
+extension Collection where Element: ~Copyable & ~Escapable {
+  func firstRefMatching<R>(predicate: (borrowing Element) -> Bool) -> Ref<Element>? {
+    // The closure we pass as `operation` is temporary in this function,
+    // so when the `Ref` ends up dependent on it, it means we can no longer
+    // return it out of this scope.
+    firstReturning { element in predicate(element) ? Ref(element) : nil }
+  }
+}
+```
+
+[^10]: Swift's existing `Collection` protocol probably can't be retroactively generalized to support non-`Copyable` or non-`Escapable` elements.
+       But we obviously want there to be *some* protocol that can do so, so drop that in instead.
+       I'm just using `Collection` for familiarity.
+
+Now, some of these examples can be fairly easily changed to work around this problem.
+A simple solution would just be to use indexes instead of `Ref`s.
+For example, the scratch array of `Ref`s could just use a scratch array of indexes.
+And `firstRefMatching` could just use `firstIndex(where:)` and then build a `Ref` directly to that element.
+This does require more indexing operations, but that's not likely to be an excessive burden.
+However, it also means that the values no longer stand alone.
+The indexes aren't `Equatable` or `Comparable` or anything else, at least not with the same semantics that the `Ref`s would've been.
+If you wanted to sort that scratch array of `Ref`s, you could just do it.
+But to sort that scratch array of indexes, you'd need to provide a comparator that compares elements of the original collection.
+Piece by piece, these kinds of limitations undermine a lot of the usefulness of being able to generalize over non-escapable values in the first place.
+
+It's also possible that the value-dependency model could be extended with some ability to support multiple kinds of dependency.
+There's an idea that's been sketched out where values can have named nested lifetimes.
+This essentially allows them to act as multiple distinct nodes in the dependency graph.
+However, that idea is very much still just a sketch.
+It may not work, and even if it does, it may not actually add a useful amount of generalization.
+
+#### Lack of explicit local annotations
+
+Another disadvantage of the current value-dependency model is that it provides no direct way to state the expected scope restrictions on a specific value.
+A function's dependency signature can say that its return value is dependent on a particular parameter.
+However, there is no equivalent way to say within the function that the value in a local variable can only depend on that parameter.
+There is no direct translation of such a statement in terms of the model; it would require an additional rule.
+This is unfortunate, because while I expect that most programmers will usually be happy to just rely on the implicit inference of scope restrictions, there are some good if situational reasons to sometimes be more explicit.
+
+First, explicit annotations can make it easier for people to learn and teach the scope restriction rules.
+When programmers feel comfortable with a language feature, they often really appreciate inference rules and syntactic sugar that make the feature less obtrusive and heavyweight.
+But newcomers to a feature often really appreciate the ability to spell these things out.
+Some programming teachers even make that a class rule, forcing their students to write out things like type declarations in assignments to help them internalize what the compiler is doing automatically for them.
+
+Second, explicit annotations provide a natural way for tools to communicate inferred scope restrictions back to programmers.
+Consider a programmer who's running into a mysterious problem with their code; maybe they've written a `Span` algorithm that's somehow crashing.
+It's reasonable for them to ask their IDE what the lifetime of the span actually is.
+Many IDEs already have similar features for e.g. spelling out the inferred type annotation when you hover over a reference to a variable.
+But those features are generally designed around making things explicit that can actually be written in the language.
+Without the ability to express such a restriction in the language, the IDE has to find some other way to communicate it (maybe as a prose comment), and the programmer has no way to double-check that the inferred annotation is actually correct.
+
+Third, explicit annotations can help programmers narrow down the cause of a compiler error.
+In an ideal world, of course, compiler diagnostics would always point you exactly at the line of code that you need to fix.
+In practice, this can be difficult.
+Lifetime errors often arise because of a conflict: a value has a lifetime dependency that it shouldn't have at the point where it's used.
+The compiler cannot know whether the problem is that the value is being used wrong (it should be okay that it has that dependency) or defined wrong (it shouldn't have that dependency).
+By being explicit about their assumptions, programmers can move diagnostics from the use site to the points where the assumption was violated.
+
+For example, consider code like this:
+
+```swift
+1  var span: Span<Int>
+2  if useGlobalArray {
+3    span = globalArray.span
+4  } else {
+5    span = localArray.span
+6  }
+7  ...
+8  saveSpan(span)
+```
+
+Suppose that `saveSpan` requires the span it's passed to be immortal, which is to say, to have no lifetime dependencies.
+A span over the global constant `globalArray` fits the bill, but a span over the local variable `localArray` does not.
+A perfect diagnostic might report on line 8 that `span` is not necessarily immortal like it's required to be, together with a note on line 5 that it won't be immortal if it's computed this way.
+But compilers don't always deliver perfect diagnostics, and it's not hard to imagine that the compiler might sometimes emit this error without the extra note, leaving the programmer to figure out why the span isn't immortal for themselves.
+However, if the programmer can add an annotation to `span` saying that it's expected to be immortal, then the compiler will stop reporting the error on line 8.
+Instead, it will report an error on line 5, when a non-immortal span is assigned into a variable that requires something immortal.
+(Of course, this isn't an excuse for compiler developers to not still try to emit the better diagnostic.)
+
+Finally, explicit annotations can help to enforce correctness when interacting with an unsafe interface.
+In safe code, the compiler will analyze both tbe uses of a value and how it's defined.
+This creates a complementary balance: the narrower the scope restriction that the compiler infers for the value, the more restricted the uses of the value will be.
+But with unsafe code, the compiler often just has to trust one side or the other, eliminating this balance.
+An explicit annotation can make sure that the compiler still enforces the assumptions that the unsafe code requires.
+
+For example, a C function might need to be passed a pointer that's valid for a specific duration in order to behave correctly.
+It's a C function, so it just takes an unsafe pointer; the lifetime restriction requirement is a documented requirement, not something that's going to be automatically enforced by Swift.
+Now suppose that some safe Swift code computes a span with the goal of passing that span to the C function.
+Without an annotation, a bug in that computation can result in a span with a narrower than expected scope, silently causing the pointer to not meet the documented restriction.
+But an explicit annotation of the required scope of the span prior to extracting the pointer from it will not just document the expectation in source, it will actually enforce it: the compiler will object if a too-narrow span is ever assigned to the explicitly-annotated variable.
+
+#### Flow-sensitive diagnostics for invariant lifetime requirements
+
+This last disadvantage is significant enough to be worthy of inclusion.
+I will readily acknowledge that it is less important than the others, though.
+
+The value-dependency model always associates lifetime dependencies with specific abstract values.
+When there's a restriction on the lifetime dependencies for some mutable variable, the model is not generally going to enforce that restriction as an invariant on the variable.
+Instead, it's going to enforce it specifically on the abstract value of the variable at some specific point.
+This is a more control-flow-sensitive rule and can easily lead to diagnostics that seem misplaced.
+
+As an example, consider a function with an `inout` parameter of non-escapable type.
+Suppose that the dependency signature of the function says that the function does not add dependencies to the parameter; that is, the final value in the `inout` parameter must have no more dependencies than the initial value.
+This is very common: it is in fact the default rule for `inout` parameters.
+
+Now suppose that, within the body of the function, there is a change to the parameter (let's suppose it's an `insert` call) which adds a dependency to its value.
+The lifetime checker will not generally be able to diagnose this immediately at the `insert` call, because it does not enforce the restriction on the parameter as an invariant.
+Instead, it will just update its internal tracking to record that there's a new dependency and continue onwards.
+In some ways, this is arguably good.
+The checker is allowing the value in the parameter to subsequently change, and if it changes to a value with the original dependencies (or less), the postcondition on the parameter will be satisfied and there's no reason to diagnose.
+
+But the consequence of not enforcing the restriction as an invariant is that the diagnostic becomes sensitive to control flow.
+Assume for the sake of argument that the value *isn't* restored to something with fewer dependencies.
+Then a fully precise statement of the error is that *there exists a control flow path leading to an exit from the function which leaves a value in the `inout` parameter with too many dependencies*.
+This is fundamentally harder to diagnose than just pointing at the `insert` call, like it could if it were enforcing an invariant on the parameter.
+The analysis has to walk the control flow of the function, and it is likely to only detect the problem when that walk actually reaches the exit.
+It might reaonably just emit the diagnostic there without even noting the call that added the dependency.
+Even if it does point out the `insert` call, it has to also point out the path that led to the exit.
+After all, the bug might not be that `insert` was called; it might just be that the value was expected to be reset later.
+It is just fundamentally harder to provide a good, concise diagnostic under this rule.
+
 
 
 ### Problems with the value-dependency model
