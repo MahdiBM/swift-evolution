@@ -381,108 +381,6 @@ Even if it does point out the `insert` call, it has to also point out the path t
 After all, the bug might not be that `insert` was called; it might just be that the value was expected to be reset later.
 It is just fundamentally harder to provide a good, concise diagnostic under this rule.
 
-
-
-### Problems with the value-dependency model
-
-In my view, there are several significant problems with the value-dependency model of lifetimes.
-
-The first is that the association between the dependency graph and the correctness property it is upholding is pretty abstract.
-Recall that correctness for non-escapable values is generally expressed in terms of scopes: certain values are only safe to use within certain scopes.
-When you write a function signature involving non-escapable types, you should be thinking about the relationship between these scopes.
-Usually, that will go something like, "The span I'm returning is just a slice of this span parameter, so it's safe to use it for the same scope that it's valid to use the original span in."
-But the value-dependency model asks you to instead think about the impact of adding various dependency edges on the lifetime checker.
-That is more like, "The span I'm returning is only safe to use within the scope of the span parameter, so I need to add a dependency edge between them."
-This is unnecessarily dissociated from the original correctness property, which can lead to confusion and misunderstandings.
-
-This confusion is a major problem for unsafe interactions.
-Getting a lifetime signature wrong in fully safe code just means you'll get an error somewhere.[^6]
-But non-escapable types are often used for low-level programming, and low-level programming often requires interacting with unsafe subsystems, such as libraries written in C or C++.
-Wrapping these subsystems up into safe Swift interfaces requires a contract between the safe and unsafe parts of the code.
-It is critical for correctness that the programmer understand that contract clearly, because the unsafe side of it is not going to be automatically checked.[^7]
-It is difficult to do this when it requires second-order reasoning about the impact of adding dependencies.
-The value-dependency model also doesn't provide a great solution for APIs that need to unsafely construct a safe wrapper type, like an `init` that wraps an `UnsafeBufferPointer` as a `Span`.
-In these cases, the `init` call does not have any natural scope dependencies, so the result is treated as maximally unrestricted.
-To a certain degree, this is an inherent problem: the compiler does have to just accept that the `Span`'s scope is appropriate for the original pointer.
-But it would be better if the code could at least explicitly communicate its expectation about that scope, so that the existence of the call doesn't completely bypass checking.
-
-[^6]: Lifetime signatures are basically logical propositions: theorems that need to be proven for the functions they're attached to.
-      The stronger the theorem, the more powerful the guarantees that clients will get when checking themselves, but also the more you will have to satisfy when checking the function definition.
-
-[^7]: For example, we'd like programmers to be able to use annotations on their C APIs to make certain parameters or return types get imported into Swift using `Span` or `Ref`.
-      We'd like the C compiler to be able to check that the C function definition satisfies its side of this guarantee, but that's going to take a lot of work.
-      In the meantime, the Swift compiler will simply have to accept the annotations as accurate.
-
-A related problem is that the value-dependency model struggles with more abstract uses of lifetimes.
-This includes abstractions over non-escapable values, such as collections, adapter types, and callbacks.
-There are several different mechanisms behind these struggles.
-
-One mechanism is that the value-dependency model naturally conflates all of the scope restrictions of a value.
-A value is a single node in the dependency graph, so it cannot distinguish between different kinds of dependency edge.
-But this is unfortunate, because a lot of abstractions have multiple levels of scope restriction.
-For example, when working with a span of non-escapable elements, there's a scope restricton associated with the memory in which the elements are stored, but there's also a scope restriction for the element values themselves.
-Conflating these means that values read out of the span necessarily pick up dependencies that only really affect the span's backing memory.
-Consider the following example:
-
-```swift
-  var arrayOfRawSpans: Array<RawSpan> = ...
-  let rawSpan = arrayOfRawSpans.span[0]
-```
-
-`arrayOfRawSpans.span` has a dependency on a borrow of `arrayOfRawSpans`.
-This is important: if we mutate `arrayOfRawSpans`, this span really does
-need to become invalid to use.
-However, this dependency is preserved onto the result of the subscript because the model does not distinguish different kinds of dependency.
-Therefore, `rawSpan` must also become invalid to use if we mutate `arrayOfRawSpans`, even though its scope restriction is naturally independent of the access to `arrayOfRawSpans`.
-
-Solving this under the value-dependency model remains an open problem.
-One idea that has been suggested is to add nested lifetimes to the model, which essentially create multiple nodes in the dependency graph associated with a value.
-We don't actually even know if that idea is sound, unfortunately; it has not been explored in depth.
-And the problem affects essentially every kind of abstraction over non-escapable values.
-For example, consider a `map` algorithm that wants to allow the result type to be a non-escapable value.
-The element-mapping function passed to `map` is generally a non-escaping closure.
-Since the model conflates all of the lifetime dependencies of a value, the result of calling that closure must carry a dependency on the closure.
-And this means the result of `map` must also carry that dependency.
-This is a problem that type-based lifetime constraints simply do not have, as we will see.
-
-It has also been suggested that the value-dependency model could be augmented, later, with support for type-based lifetime models.
-Certainly this cannot be ruled out; with enough compiler effort, we can move mountains.
-However, the value-dependency model does not easily extend in this direction, and in some ways it contradicts it.
-In type-based lifetime models, a `~Escapable` generic type parameter is usually expected to carry a specific scope constraint along with it when substituted.
-But this changes the interpretation of that type parameter in generic code from what you naturally get from the value-dependency model.
-Consider a type like this:
-
-```swift
-struct Wrapper<T: ~Escapable> {
-  var value: T { get { ... } }
-}
-```
-
-Under the value-dependency model, the `value` getter is understood to produce a `T` that depends only on the borrow of `self`.
-This value could be synthesized directly by the getter.
-But under a type-based lifetime model, substitution of `T` will carry along a scope restriction determined by the client of the type.
-The getter is then expected to produce a value that satisfies that scope restriction.[^8]
-This is just a radically different interpretation of what it means to have a non-escapable type parameter.
-
-[^8]: Since the scope is decided by the client at the level of the type, it might be (and almost certainly is) some scope broader than the borrow of `self` for this specific call. An implementation that depended on `self` would be invalid.
-
-Furthermore, a basic goal of type-based models is that they can be used to explicitly specify the scope constraints to values.
-For example, you could say that a local variable is required to hold a span with a specific lifetime.
-There is no way to express such constraints in terms of value dependencies, and nothing in the lifetime analysis described above would naturally check it.
-It requires a different strategy for analysis.
-
-Finally, the value-dependency model turns almost everything about lifetime checking into a flow-sensitive problem.
-This can permit more things, but it also makes it harder to generate good diagnostics for certain issues, especially those that arise from lifetime invariance.
-Consider a mutable variable of non-escapable type.
-If the variable is just a local `var`, it's generally fine to add dependencies to it; the lifetime analysis will simply update its internal state.
-But other variables must be invariant in their lifetime restrictions, meaning they cannot gain dependencies.
-For example, if the variable is an `inout` parameter, any changes to its dependencies must be stated (or implied) by its signature.
-Ideally, if you write code that transparently violates these restrictions, it will be diagnosed at the call site.
-However, the flow-sensitive analysis allows these calls to occur.
-After all, there might be more changes, later in the function, that will restore the final value in the variable to something that satisfies the constraints.
-As a result, the analysis is naturally prone to diagnosing these violations as state conflicts when the end of the function is reached.
-It is not in any way impossible to make sure the violation is diagnosed at the problematic call site, but it is more difficult.
-
 ### Advantages of the value-dependency model
 
 None of that is to say that there aren't upsides to the value-dependency model.
@@ -490,7 +388,7 @@ None of that is to say that there aren't upsides to the value-dependency model.
 Probably the biggest advantage is that it builds relatively directly on top of existing analyses in the compiler.
 This is, after all, what has allowed the feature to be delivered so far.
 And many use cases of non-escapable values do not run into any of the difficulties around abstraction that I've laid out above.
-If you just want to support working with spans of trivial values, with minimal abstraction you don't need much from the lifetime system.
+If you just want to support working with spans of trivial values, with minimal abstraction, you don't need much from the lifetime system.
 
 A more fundamental advantage arises from flow-sensitivity.
 In type-based lifetime models, it is still generally true that any given variable has a single type for its duration.
@@ -514,176 +412,262 @@ Most code that builds up a collection this way does not have interleaved uses of
 Moreover, the uses are likely to be uniform, meaning that if they work with the narrow restriction at the end, they would also work with an artificially narrow restriction at the beginning.
 And if the programmer really needs this, they can assign the array to a new variable, allowing the compiler to infer a broad scope for the first variable and a narrow scope from the second.
 
-
 ## The type-based model of scope restrictions
 
-Okay, let's step back for a moment.
-The core correctness property we're trying to achieve with non-escapable values is that certain values must only be used within certain scopes.
-We have a system in Swift for restricting how values are used: the static type system.
-It's natural to ask if we can make the type of a value reflect the scope restrictions on it.
-Doing so lets us immediately take advantage of normal type system operations, like generic argument substitution, to propagate those restrictions through abstractions and signatures.
-And since it aligns the language model directly with the core correctness property, it makes it straightforward to reason as programmers about how those restrictions need to play out in code.
+Let's go back to the basic problem.
+The core correctness property we'd like to allow to be proven is that certain values are only used within appropriate scopes.
+Static type systems are designed to restrict how values can be used.
+It's reasonable to ask if these scope restrictions could instead be expressed in types.
 
-Abstractly, this model closely resembles Rust's approach to scope restrictions.
-That does not require us to make the same syntactic decisions that Rust does, however.
-I believe there is a workable syntax that largely (perhaps even completely) avoids the need for named lifetime parameters.
-And, just like Rust, I think we can avoid requiring the simple dependency rules that dominate most use patterns to be written explicitly.
+Now, we have an existence proof that this can work, because this is exactly what Rust does.
+It does have some challenges and complexities, which I'll discuss below.
+But it also allows a lot of things to be expressed that we don't know how to express in the value-dependency system, allowing a lot of basic generic expressivity over non-escapable types.
+And it's demonstrated a reasonable ability to evolve over time, as Rust's lifetime system has been gradually expanded over the years to allow for more things.
+Adopting a type-based model does not require immediately adding every feature of Rust's lifetime types system; Swift can decide where to draw the line, release by release, and if we think a particular generalization is not worth the implementation cost, we don't have to add it.
 
-I am presenting this models as if it were *the* alternative to the value-dependency model.
-I don't have a formal argument for why that would be true; there may be other compelling options.
-But we know that this is a sound and workable model that supports a reasonable base of abstraction and generalization in Rust libraries.
+It also does not require adopting Rust's syntax for lifetime qualifiers.
+As I go through the language, I will sketch out what I feel is a workable and more Swift-like design.
+Of course, there are many other options.
+I am providing a concrete syntax primarily to elucidate the text.
 
-### Basic concepts
+### Concrete scope restrictions
 
-I have to apologize for this section, because there's going to be quite a lot of forward-reference here.
-Please bear with me.
+Any given non-escaping type has a set of concrete scope restrictions.
+These are the scopes that we need to be able to talk about in order to properly restrict the use of values of the type.
 
-There are two fundamental ideas in the type-based model:
+Most non-escapable types have at most one such restriction.
+As I'll discuss soon, scope restrictions associated with generic arguments are handled differently.
+Therefore, a type only needs a concrete scope restriction if it is unconditionally non-escapable.
+It only needs multiple concrete scope restrictions if it has multiple independently-scoped reasons why it's unconditionally non-escapable.
 
-1. Every unconditionally non-escapable type has one or more *scope bindings* representing its scope restrictions.
-
-2. After *scope reconstruction*, the type structure of every unconditionally non-escapable type in a *concrete position* always includes *scope specifiers* corresponding 1-1 to its scope bindings.
-
-#### Scope bindings
-
-We would probably want scope bindings to be writable explicitly.
-But most types will only have one binding, and it might be sensible to just infer a default one with a standard name.
-
-Placeholder syntax:
+So let's sketch out a syntax for specifying within a value's type that the value is restricted to a specific scope:
 
 ```swift
-struct Span<Element> : ~Escapable {
-  scope memory
+// We'll talk about what goes in the parentheses later.
+var span: @scoped(array) Span<Int>
+```
+
+Whenever we have a value of such a type, the type must have a scope restriction.
+Of course, we would normally want that scope restriction to be inferred:
+
+```swift
+// We'll talk about how the `@scoped` restriction can be inferred later.
+var span: Span<Int>
+```
+
+But it can always be spelled out.
+
+This syntax assumes that there's exactly one concrete scope restriction associated with the type.
+That's true for `Span`.
+As long it's true, we don't need any way to name different scope restrictions, or to declare names for them in the type.
+However, it's not true for all types.
+If it were only false for really weird types, we could probably reasonably subset it out of the language, at least to start.
+Unfortunately, it does come up quite easily with types that just store multiple non-escapable values, like the following:
+
+```swift
+struct SpanPair<T>: ~Escapable {
+  let left: Span<T>
+  let right: Span<T>
 }
 ```
 
-Builtin unconditionally non-escapable types, like non-`@escaping` function types, would behave as if they had an implicit such declaration with some name TBD.
-
-I don't think there's any way that a type can ever evolve its set of scope bindings; it's fixed at first release.
-But maybe I'm missing something.
-
-
-#### Scope specifiers
-
-Scope specifiers are typically inferred by scope reconstruction (basically, lifetime analysis).
-But they do also need to be writable explicitly in source for a variety of reasons:
-- to specify relationships in the signatures of functions and properties;
-- to let programmers verify their understanding of what's being inferred, especially to guide diagnostics; and
-- to let programmers force a specific scope, especially around unsafe code.
-
-Placeholder syntax:
+Stored properties are types of values, so the concrete scope restrictions do need to be given in these types.
+We could add a syntax for declaring named scope restrictions, like so:
 
 ```swift
-@scoped(memory: x) Span<Int>
+struct SpanPair<T>: ~Escapable {
+  scope _left
+  scope _right
+
+  let left: @scoped(_left) Span<T>
+  let right: @scoped(_right) Span<T>
+}
 ```
 
-The label must be that of a scope binding in the type. But there's no good reason to require the label when there's only one scope binding in the type, which would be predominantly true, so usually this would just be
+But I don't think this is actually required.
+(It may be necessary to express more complex cases, but it can probably be subsetted out of the language to start.)
+Instead, I think we can simply infer anonymous scope restrictions to "fill in" all the unspecified scope restrictions on stored properties.
+
+We do need to extend the `@scoped` attribute (or whatever the syntax ends up being) to allow multiple scope restrictions to be specified:
 
 ```swift
-@scoped(x) Span<Int>
+var pair: @scoped(left: &array1, right: &array2) SpanPair<Int>
 ```
 
-I think we'd generally not want it to be written in a generic argument position.
+Here I've just allowed `@scoped` to take multiple name/scope pairs.
+Names can resolve to properties of non-escapable type, which provides a natural way to specify the otherwise-anonymous scope restrictions created for stored properties.
+If there's a single "pair", and it doesn't actually have a name, the type needs to only have a single scope restriction.
 
-The argument of the specifier must somehow specify a scope, and I'll talk more about syntax for that later.
+Note that this model hasn't actually added any syntactic burden to the definition of the non-escapable type so far.
+We've just found a reasonable interpretation of the existing code that lets us propagate implicit scope specifiers on types.
+We've only gained the option of being more specific.
 
-Scope specifiers are part of the structure of a type and are therefore carried by type substitution.
+So how do you specify a scope?
+This is definitely a place we can expand over time.
+What I think we clearly need at start is at least:
 
-Note that *conditionally* non-escapable types don't get scope bindings or specifiers.
-The specifiers get applied to their generic arguments instead: `Optional<@scoped(x) Span<Int>>`, not `@scoped(x) Optional<Span<Int>>`.
+- The name of a variable of non-escapable type, from which we take its concrete scope restriction, e.g. `@scoped(otherSpan) Span<Int>`.
 
-#### Concrete positions
+- Some syntax for specifying the scope of a `borrowing` or `inout` parameter (not necessarily of non-escapable type), e.g. `@scoped(&self) Span<Int>`.
 
-A *concrete position* is a position that requires a scope-applied type.
-The intuition is: any place you would write a type that directly describes the type of a value, or that might after generic substitution.
-Types of variables, properties, parameters, results, case payloads, and tuple elements are always concrete positions.
-`~Escapable` type parameters and associated types may be declared to not be concrete positions; more on this later.
-Generic arguments and associated type witnesses are concrete positions if the corresponding parameter or associated type declaration is.
+- Some syntax for specifying the global scope, e.g. `@scoped(immortal) Span<Int>`.
 
-#### Rule of scope specifiers after reconstruction
+To this we could gradually add member paths, intersections, scopes of local variables, and so on.
+We'll probably need to support most of those in the implementation right away --- they can come up in scope inference very easily --- but we don't necessarily need user-facing syntax for them.
 
-Every non-escapable type (conditional or not) in a concrete position (and thus: the type of every non-escapable value) must have, somewhere in its type structure, either:
-- a `~Escapable` type parameter or associated type thereof in a concrete position, or
-- an unconditionally non-escapable type in a concrete position, which must therefore have scope specifiers after scope reconstruction.
+### Applied and unapplied non-escapable types
 
-This rule actually just falls out naturally from a sensible restriction on conditional `Escapable` conformances: that they can only be conditional on the escapability of a concrete generic argument of the type.
-I believe this is not currently true, both because the concept of concrete type parameters is novel to this document and because we allow these conformances to be conditioned on certain other marker protocols.
-But I don't think fixing that would be a noticeable loss.
-Note that this rule is preserved by generic substitution: when you replace a dependent type, either the replacement is escapable (eliminating whatever contribution this use of the parameter made to the non-escapability of the overall type) or it obeys the rule (and therefore satisfies the rule for the overall type).
+Not every place you can write a type is immediately the type of a value.
+Forcing such a type to always carry scope restrictions would rule out code that we don't want to rule out.
+
+We can see this directly with a `typealias`:
+
+```swift
+typealias ISpan = Span<UInt32>
+
+func slice(span: ISpan) -> ISpan { ... }
+```
+
+We could try to interpret this by inferring a scope restriction to apply to all uses of `ISpan`.
+That's probably not want the programmer wants, though.
+They probably want writing `ISpan` to behave just like they'd written `Span<UInt32>`.
+That is, they want this use of `Span` to stay *unapplied* to a scope restriction so that a scope restriction can be decided from context in the usual way.
+
+If they did want `ISpan` to apply a common scope restriction, they could just write the scope restriction directly in the `typealias`, like so:
+
+```swift
+typealias ISpan = @scoped(immortal) Span<UInt32>
+
+func slice(span: ISpan) -> ISpan { ... }
+```
+
+This divide between applied and unapplied types is very important in the type-based model.
+That's especially true for abstract positions like generic parameters and associated types.
+With `typealias`es, Swift can really muddle through well enough using any rule; the compiler can always locally choose to look through the `typealias` or throw away scope restrictions if it helps make reasonable code compile.
+With the generic positions, Swift really needs to know what the programmer wants, because it's not reasonable for the compiler to do some global analysis of how a generic parameter is used to figure it out.
+
+`Iterable` provides an excellent example of a protocol that requires both:
+
+```swift
+protocol Iterable<Element>: ~Copyable, ~Escapable {
+  associatedtype IterableIterator: ~Copyable & ~Escapable
+  associatedtype Element: ~Copyable & ~Escapable
+  where Element == IterableIterator.Element
+
+  func makeIterator() -> IterableIterator
+}
+```
+
+The `Element` associated type almost certainly ought to be an applied type.
+This would rule out some largely theoretical conformances --- types that synthesize non-escapable elements during each call to `nextSpan`  --- while promoting a very clean, unrestricted programming model for standard conformances when they're generalized to support non-escapable elements.
+This is because applied types provide a very straightforward generic model.
+The applied scope restriction must be derived somehow from the type of `self`, which means the scope in the restriction must always be broader than the current function call.
+Any context that expects a value of the applied type will have its own contextually-equivalent understanding of the scope restriction expressed in the element type.
+This all means that generic code can usually move and copy values of applied types around freely, subject only to fairly minor restrictions, like not doing truly escaping things like e.g. wrapping them up as an `Any`.
+That's a very strong and desirable property for collection elements in generic code.
+
+In contrast, unapplied types tend to end up with highly conservative scope restrictions that make them dependent on specific calls and accesses rather than allowing broad data flow limited only by the type.
+This is necessary for types like `IterableIterator`, where the protocol really does need clients to infer a different scope restriction for every unique call to `makeIterator`.
+
+Since there are use-cases for both, it's necessary to have a syntax for declaring generic parameters and associated types as either.
+At the moment, I believe that the right default is for these positions to expect an applied type.
+Unapplied types therefore ought to be called out when they're needed.
+
+I'm not sure what the right syntax for unapplied types would be.
+In general, unapplied types aren't merely "unapplied": there's an expected signature for the scope restrictions that need to be applied to them.
+This is effectively a very restricted form of higher-kinding in the type system.
+I would guess that we don't really need to support more than the simple pattern of a single scope restriction, though.
+An attribute like `@unscoped` on the generic parameter or associated type might be fine for that.
+
+### Function signatures
+
+Parameters and results of functions are types of values, so if they have non-escapable type, those types must have concrete scope restrictions.
+
+Function declarations involving non-escaping types will generally have some number of scope parameters.
+Usually these will all be implicit, and we can probably start with that.
+It's going to be beneficial for the explanation if I can write them out, though, so I'm going to invent a syntax.
+I can't think of a better choice offhand than writing it like a generic parameter:
+
+```swift
+func returnEither<scope a, scope b>(spanOne: @scoped(a) Span<Int>,
+                                    spanTwo: @scoped(b) Span<Int>)
+         -> @scoped(a & b) Span<Int>
+```
+
+Just like we did with type definitions, we can infer all of this by default:
+
+```swift
+func returnEither(spanOne: Span<Int>, spanTwo: Span<Int>) -> Span<Int>
+```
+
+The way this works is straightforward.
+Since parameters have to have concrete scope restrictions, and the programmer hasn't given us one explicitly for `spanOne` or `spanTwo`, we synthesize new anonymous scope parameters to fill them in.
+The compiler then applies heuristics to find a scope restriction for the return type, just like it does today under the value-dependency model.
+That ends up being an intersection of the two anonymous parameter scopes.
+
+If the programmer needs to take control, they won't usually have to write out explicit scope parameters.
+In most cases, they should be able to just name the value parameters:
+
+```swift
+func returnFirst(spanOne: Span<Int>, spanTwo: Span<Int>)
+         -> @scoped(spanOne) Span<Int>
+```
+
+An explicit scope parameter might be necessary in more complex cases:
+
+```swift
+func returnASpan<scope s>(span: Span<@scoped(s) Span<Int>>)
+       -> @scoped(s) Span<Int>
+```
+
+Note that this is already not expressible in the value-dependency model without losing information through dependency conflation.
+I think subsetting this capability at first would probably be fine.
+
+### Inferring scope restrictions
+
+The uses of non-escapable types in a function under the type-based model naturally create a system of scope equalities and inequalities.
+Inferring scope restrictions essentially involves solving this system.
+A lot of the logic of that should be very similar to the process of solving the dependency-set relationships introduced by the scope-dependency model.
+However, there are some significant differences.
+
+The first difference is that, in the value-dependency model, variables in the system are associated 1-1 with specific abstract values.
+In the type-based system, variables are introduced mostly for declarations and calls.
+A use of a function or type that's generic over scope restrictions essentially "opens" that entity's signature, creating fresh scope variables in the solver.
+Explicit scope specifiers on types can immediately resolve some of these variables, but the rest must be inferred through solving.
+
+The second is that, in the type-based model, type substitution can create complex equality relationships between different parts of the system.
+However, it is still the case that the system is purely conjunctive.
+
+And finally, the type-based model must reason about scope variance relationships between various types.
 
 ### Scope variance
 
-Scopes are partially ordered by the containment relation.
-Two scopes can always be intersected; this may produce an empty scope.
-There is a global "immortal" scope that contains all other scopes.
-Intersection with the immortal scope is the identity operation.
+Scopes have natural relationships with each other: some scopes are contained within others.
+Two scopes can also always be intersected, although this may produce an empty scope.
 
-There is also a scope subtyping relation between types.
+There is a closely related subtyping relationship between types that carry concrete scope restrictions.
+This system of scope variance preserves a lot of the flexibility of the value-dependency model under the type-based model, because it allows for scopes to be naturally shrunk until they can be merged.
+For example, in the scope-dependency model, when you insert spans into an array, the spans are not required to have exactly the same dependencies.
+Instead, the array value accumulates dependencies from each of those spans.
+In the type-based model, the element type of the array does have to have a consistent scope restriction.
+However, that scope restriction is typically a variable that must be inferred.
+Whenever a span is inserted into the array, it creates a constraint that the type of that span must be a subtype of the type of the element, and thus that the scope restriction in that span's type must be a superscope of the scope restriction of the element type.
+The scope restriction of the element type will thus be inferred to be an intersection of the scope restrictions of the spans, imposing an essentially similar overall constraint as was imposed by the value-dependency model.
+
 In the examples that follow, let `smaller` and `bigger` be two scopes such that `bigger` contains `smaller`.
 
 - Every non-escaping type is covariant with respect to its immediate scope specifiers.
-  For example, `@scoped(smaller) Span<Int>` is a scope subtype of `@scoped(bigger) Span<Int>` because `smaller` is contained within `larger`.
+  For example, `@scoped(smaller) Span<Int>` is a subtype of `@scoped(bigger) Span<Int>` because `smaller` is contained within `larger`.
 
 - Types may be covariant, contravariant, or invariant with respect to their concrete `~Escapable` type parameters.
-  For example, `Span` is covariant in its type parameter, so `@scoped(x) Span<@scoped(smaller) Span<Int>>` is a scope subtype of `@scoped(x) Span<@scoped(larger) Span<Int>>`.
+  For example, `Span` is covariant in its type parameter, so `@scoped(x) Span<@scoped(smaller) Span<Int>>` is a subtype of `@scoped(x) Span<@scoped(larger) Span<Int>>`.
   But `MutableSpan` is invariant in its type parameter, so `@scoped(x) MutableSpan<@scoped(smaller) Span<Int>>` is not related to `@scoped(x) MutableSpan<@scoped(larger) Span<Int>>`.
-  We would need syntax for this.
-  I believe Rust has a defaulting rule for it, but it's based on a deep inspection that I'm not sure we want to do.
-
-- If two types are scope-subtypes, they are also subtypes for the normal subtype relationship, meaning that values can be converted between them.
-
-### Type checking and scope reconstruction
-
-Scope reconstruction is the process of either inferring scope specifiers in all positions where they are required or diagnosing why inference is impossible.
-The basic checking model for scope reconstruction is as follows:
-- Scope specifiers are placed in types where required by the standard type-checker, but are left expressed in terms of unresolved scope variables.
-- The standard type-checking passes assume that unresolved scope variables are always related, which should mean that the specifiers have no effect on the passes when there are no explicit annotations.[^10]
-  It may or may not be a good idea of consider explicit annotations at this stage.
-- The lifetime passes attempt to resolve all of the unresolved scope variables, repairing and extending scopes as necessary to find a valid assignment.
-
-[^10]: It may be a good idea to stage the insertion of unresolved scope variables after constraint solving.
-
-These passes will use many of the same basic dependency-inspection analyses as the current passes do.
-However, since the scope variables can create scope relationships between dependency-unrelated values in the function, resolving variables may require a more holistic algorithm within function bodies: essentially, it must solve a system of scope inequalities.
-Fortunately, the system is a pure conjunction, which means the solver doesn't need to be nearly as complicated as the typechecker's constraint solver is.
-
-The passes will need to be able to determine the required inequality by inspecting SIL.
-One approach to this would be to encode scope specifiers in SIL, which would require some kind of scope-converting instruction.
-The passes would then just search the function for these conversions and determine the inequalities from the types involved.
-However, that would require the specifiers to be make explicit in SIL, and then probably stripped therefater.
-An alternative approach would be to determine the inequalities from call sites in the function, similar to how the current analysis works.
-
-### Syntaxes for scope specifiers
-
-(to be written)
-
-### Non-concrete type positions
-
-(to be written)
-
-
+  We would need syntax for declaring this.
+  I believe Rust has a defaulting rule for it, but I think it's based on a deep inspection that I'm not sure we want to do.
 
 [SE-0176]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0176-enforce-exclusive-access-to-memory.md
 [SE-0414]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0414-region-based-isolation.md
 [SE-0446]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0446-non-escapable.md
-[SE-0447]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0447-span-access-shared-contiguous-storage.md
-[SE-0467]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0467-MutableSpan.md
 [SE-0516]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0516-borrowing-sequence.md
 [SE-0519]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0519-ref-mutableref-types.md
 [SSA]: https://en.wikipedia.org/wiki/Static_single-assignment_form
-
-
-
-
-
-
-
-
-Swift currently implements a straightforward model for non-escapable types based on value dependencies.
-This is sufficient to allow a lot of basic types to be defined, like the `Span` and `MutableSpan` types added by [SE-0447][] and [SE-0467][], and these types have seen substantial practical use.
-It is, of course, good that we've been able to deliver these features, and the discussion about fundamental models that follows is not meant to suggest that we've made any serious missteps there.
-The most important use patterns of non-escapable types, for most developers, fit within a relatively simple subset that doesn't look too different in different models of lifetimes.
-But I do think there are major problems with the value-dependency model, problems that we are running into more and more as we try to build out abstractions over non-escapable types, like allowing the element types of pointers and [iterable containers][SE-0516] to be `~Escapable`.
-And I am particularly concerned that the model makes it too easy to misunderstand the generalizations we're looking at, potentially leading us to make the *wrong* generalizations.
-
-My concrete proposal in this document is that Swift should switch to a type-based model for the lifetime restrictions on non-escapable types. The third section of the document lays out the basic requirements on the model as I see them. I believe that we can design a syntax for describing lifetime relationships on top of that model that avoids the weaknesses of the Rust syntax while still permitting a straightforward and high-performance dynamic erasure semantics.
