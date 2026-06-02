@@ -665,6 +665,10 @@ In the examples that follow, let `smaller` and `bigger` be two scopes such that 
   We would need syntax for declaring this.
   I believe Rust has a defaulting rule for it, but I think it's based on a deep inspection that I'm not sure we want to do.
 
+## Proposed engineering plan
+
+(to be written)
+
 [SE-0176]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0176-enforce-exclusive-access-to-memory.md
 [SE-0414]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0414-region-based-isolation.md
 [SE-0446]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0446-non-escapable.md
