@@ -441,6 +441,12 @@ Most code that builds up a collection this way does not have interleaved uses of
 Moreover, the uses are likely to be uniform, meaning that if they work with the narrow restriction at the end, they would also work with an artificially narrow restriction at the beginning.
 And if the programmer really needs this, they can assign the array to a new variable, allowing the compiler to infer a broad scope for the first variable and a narrow scope from the second.
 
+If we find it too useful to lose, this kind of flow-sensitive typing can still be supported under the type-based model.
+Rather than modeling the local declaration as having a single type, we would allow each use of it to observe a different type.
+A similar data flow analysis as to that currently performed for the value-dependency model would then relate the type at each observation to the types at previous observations.
+Ultimately this would just factor into the system of scope relationships that must be solved, here inferring bound types at each observation rather than globally for the local declaration.
+This flow-sensitive analysis would only be used if the variable lacked an explicit scope specifier.
+
 ## The type-based model of scope restrictions
 
 Let's go back to the basic problem.
@@ -655,6 +661,32 @@ func returnASpan<scope s>(span: Span<@scoped(s) Span<Int>>)
 Note that this is already not expressible in the value-dependency model without losing information through dependency conflation.
 I think subsetting this capability at first would probably be fine.
 
+Swift expresses ownership on function parameters and (in some cases) results as its own built-in concept.
+(This is in contrast to Rust, in which non-consuming ownership is universally expressed with `&` types.)
+In some situations, it may be necessary to express scope restrictions directly for the borrow / `inout` access scopes associated with those parameters.
+For example:
+
+```swift
+extension Collection {
+  // The scope restriction lets us indicate that the borrow of the element
+  // passed to `visitor` is valid for exactly as long as the borrow
+  // of `self` performed for the call to `visit`. Otherwise, the closure
+  // will only be able to assume that the borrow is valid for the scope of
+  // the current call to the closure. (That is, the element could be
+  // temporary to the implementation of `visit`, rather than borrowed
+  // directly from the collection.)
+  //
+  // This conservative assumption would be the default (and therefore
+  // sometimes need to be overridden) under any model.
+  //
+  // Note that the narrowness of the value ownership of the element is
+  // orthogonal to the issue we discussed previously about the scope
+  // restrictions in the Element type. This annotation is useful even if
+  // Element is an escapable type.
+  func visit(visitor: (@scoped(&self) borrowing Element) -> Void)
+}
+```
+
 ### Inferring scope restrictions
 
 The uses of non-escapable types in a function under the type-based model naturally create a system of scope equalities and inequalities.
@@ -697,15 +729,67 @@ In the examples that follow, let `smaller` and `bigger` be two scopes such that 
   We would need syntax for declaring this.
   I believe Rust has a defaulting rule for it, but I think it's based on a deep inspection that I'm not sure we want to do.
 
+### Standard library Scope type
 
-- higher rank
-- scope specifiers on borrowing/inout
-- stdlib Scope values for explicit arguments
-- captures
+There are certain situations where it would be useful to be able to explicitly specify a scope when calling a function.
+For example, `Span` has an initializer that accepts an `UnsafeBufferPointer`.
+Currently the resulting span value has no dependencies and is therefore somewhat treacherous to use, since there's no way to tie it to the scope in which the buffer is presumptively valid.
 
-## Proposed engineering plan
+The syntax discussed up to now has no way to explicitly provide a scope argument to a function.
+In fact, Swift generally has no way to explicitly provide generic arguments of any kind to a function.
+Instead, Swift expects generic arguments to be given using metatype parameters: the client passes `Int.self` to a parameter of type `T.Type`, and the type checker infers that `T` must be `Int`.
+A similar concept can apply to scope parameters; we just need some type whose sole purpose is to carry a scope specifier.
+
+This could be done by just creating a trivial non-escapable type in the standard library:
+
+```swift
+struct Scope: ~Escapable {}
+```
+
+A function that wants an explicit scope parameter would just take a value of this type:
+
+```swift
+extension Span {
+  init<scope s>(wrapping buffer: UnsafeBufferPointer<Element>,
+                in scope: @scoped(s) Scope)
+     -> @scoped(s) Span<Element>
+}
+```
+
+This could be called something like this:
+
+```swift
+Span(wrapping: buffer, in: @scoped(&self) Scope())
+```
+
+Both the type and the initialization syntax could be sugared, of course.
+
+### Function values that are polymorphic over scopes
 
 (to be written)
+
+### Closure captures
+
+(to be written)
+
+## Sketch of an engineering plan for switching
+
+If we accept that we should switch to the type-based model of scope restrictions, we will need a plan for how to pull that off.
+Unfortunately, the models are subtly different, and neither can be considered a true superset of the other.
+Nor do they interact especially well at a formal level; I do not think it would be a good idea to try to implement both.
+
+In the short term, we should avoid adding more features to Swift that would make it harder to maintain source compatibility in the long term if Swift switches to a purely type-based model.
+Most importantly, this means not generalizing any generic parameter or associated type to allow non-`Escapable` types if we would want that type to be a bound type in the long term.
+That includes the `Element` associated type of any collection-ish protocols, such as `Iterable`.
+It also includes the generic type parameter of any collection-ish generic types, including `Span`, `Ref`, and the unsafe pointers.
+(`Optional` and `Result` were already generalized in Swift 6.2, and we'll just have to deal with that somehow.)
+
+Note that it is specifically not a problem to introduce `Iterable`, despite it having a non-escapable `IterableIterator` associated type.
+This is because that associated type would not be a bound type under the type-based model.
+Iterators pick up their (non-`Element`) scope restrictions from the borrows of `self` performed for calls to `makeIterableIterator`, not from the type of the collection.
+The problem is only in generalizing `Iterable` to allow non-escapable element types.
+
+Andrew Trick is preparing a separate paper for the rest of the engineering plan.
 
 [SE-0176]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0176-enforce-exclusive-access-to-memory.md
 [SE-0414]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0414-region-based-isolation.md
