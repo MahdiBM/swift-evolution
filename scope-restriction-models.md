@@ -146,74 +146,12 @@ There's a good reason we started with this model.
 
 (This is not meant to downplay the amount of work that's gone into implementing the current feature.
 The compiler does some very impressive things, especially around shrinking and extending scopes in order to avoid unnecessary violations of the model's restrictions.
-And it's worth nothing that almost all of that work would still be necessary if Swift switched to a different language model.
+And it's worth noting that almost all of that work would still be necessary if Swift switched to a different language model.
 The analysis parts of it would just get consumed in a different way, and the rewriting parts should be exactly the same.)
 
 ### Problems with the value-dependency model
 
-#### Scope restrictions cannot be expressed on types
-
-The biggest problem with the value-dependency model is that scope restrictions are never carried directly abstractly by types.
-Scope restrictions can only ever be applied to specific values, like the parameters or results of a function, and different values of the same type can always have different dependencies.
-This makes it impossible to write a scope restriction in an abstract type position, such as a generic argument or an associated type.
-And that makes it impossible to express a lot of things, like collections of non-escapable values with a specific scope restriction.
-When you try, you end up with lifetime dependencies that are wildly conservative, often uselessly so.
-And ultimately that means that many generic abstractions that should be perfectly suitable for non-escapable types end up being impossible to write.
-
-Consider the `Iterable` protocol proposed by [SE-0516][].
-The protocol defines an `IterableIterator` associated type which is allowed (actually expected) to be non-escapable.
-It also defines an `Element` associated type, which we would also like to allow to be non-escapable in order to support collections of non-escapable values.
-
-Now, the protocol requires an `Iterable` value to have a `makeIterableIterator` method.
-Whenever you call this method, you must borrow the collection, and the iterator it returns should only be used within the scope of that borrow.
-The value-dependency model has no problem expressing this scope restriction.
-Note that different calls will be restricted to different borrow scopes.
-Nothing about the type of the collection has anything to say about the scope of the iterator, nor should it.
-
-The iterator thus produced is now required to have a `nextSpan` method that returns back a `Span<Element>`, and this is where the model runs into a problem.
-What is the scope restriction of the elements of this span?
-The value-dependency model can only express this in terms of the lifetime of something passed in to the method.
-Most likely, I expect the scope restriction to be the same as the scope restriction on the elements of the original collection.
-But the model has no way to talk about that; there is no concept in the model of the scope restriction on the elements of the collection.
-There are only lifetime dependencies on the collection value as a whole.[^8]
-The model's natural interpretation of the signature of `nextSpan`, given a non-escapable `Element` type, is that the scope restriction of the element is the same as the scope restriction of the span itself: the scope of the `inout` access made for the call to `nextSpan`.
-That is, `nextSpan` is permitted not only to materialize elements into a temporary array, but to actually construct the values in that array with a novel temporary scope restriction.
-This means that the caller of `nextSpan` is incredibly constrained.
-A `for` loop using this protocol to iterate a collection of non-escapable values — even if they're fully copyable — cannot persist a value between iterations of the loop.
-
-[^8]: There has been a small amount of exploration of the idea of having multiple "nested" lifetimes associated with a given abstract value, specifically with the goal of addressing this issue.
-      In some cases, that might help.
-      It would not help here, because that nested lifetime structure would only be known for a concrete conforming type and cannot be referenced in the abstract protocol requirement.
-      So the protocol requirement is stuck making the extremely pessimistic lifetime statement I describe here.
-
-Now, one could argue that this is just a more general signature.
-It is possible to imagine an abstract value producer that would benefit from the flexibility to synthesize non-escapable elements bound to the iteration, although it's quite a bit of a stretch.
-Perhaps a protocol like `Iterable` really should aim to allow that.
-We've already discussed the possible need for refinements of `Iterable` that give stronger lifetime guarantees about the spans returned; maybe this fits into that.
-
-But the same expressivity problem would still affect all of these less-abstract protocols.
-Suppose there's a `Container` protocol that represents a concrete, in-memory collection, and it mandates a `ContainerIterator` for which `nextSpan()` returns a `Span` constrained not to the scope of the `nextSpan` call, but to the lifetime of the iterator itself (presumably the lifetime of the borrow of the original collection).
-We can still ask, what is the lifetime of the elements?
-The protocol is still allowing it to be as narrow as the borrow of the original collection, but that's still over-constrained: the elements are necessarily usable in some broader scope than just this specific borrow of the container holding them.
-In theory, the protocol is allowing them to be synthesized as part of the `makeIterator` call, because it has no ability to associate a scope restriction specifically with the element values.[^9]
-There's no obvious implementation which could take advantage of that flexibility, since (barring something reference-type-ish) the `makeIterator` call does not have the ability to mutate anything to set that up, but nonetheless, that's all that the protocol would guarantee.
-
-[^9]: It may be possible under a nested lifetime approach to allow the nested lifetime to also be abstracted over in the protocol and named in protocol requirements.
-      However, conformances are associated with types, not values.
-      This idea would need to be explored further, but I believe it may still require a major model shift towards type-based scope restrictions.
-
-Could we wait to solve that problem?
-We could release `Iterable` over non-escapable elements using this more general, value-dependency-friendly signature, then use a type-based design for the more cncrete `Container` protocols.
-Unfortunately, that would come with some very foundational problems.
-The `Element` associated type for `Iterable` would have to be an "abstract" non-escapable type, like `IterableIterator` is, with its scope restrictions left to be filled in from context.
-But the `Element` associated type for `Container` would be different, carry its scope restrictions explicitly.
-It's really unclear how that would work.
-Not only are those different types with very different interpretations when used, but they're differently-*kinded* types.
-It seems likely that permitting this mismatch, where `Element` can have different interpretations in different contexts, would be a huge mess at every level, from the implementation up to the user-facing design.
-
 #### Conflation of different scope restrictions
-
-This is closely related to the previous point.
 
 The current value-dependency model does not have the ability to distinguish different kinds of lifetime dependency.
 This is unfortunate because values may naturally have scope restrictions for multiple independent reasons.
@@ -274,22 +212,113 @@ extension Collection where Element: ~Copyable & ~Escapable {
        But we obviously want there to be *some* protocol that can do so, so drop that in instead.
        I'm just using `Collection` for familiarity.
 
-Now, some of these examples can be fairly easily changed to work around this problem.
+Now, these examples can be changed to work around this problem.
 A simple solution would just be to use indexes instead of `Ref`s.
 For example, the scratch array of `Ref`s could just use a scratch array of indexes.
 And `firstRefMatching` could just use `firstIndex(where:)` and then build a `Ref` directly to that element.
-This does require more indexing operations, but that's not likely to be an excessive burden.
+This does require more indexing operations, but that's probably not too high of a burden.
 However, it also means that the values no longer stand alone.
-The indexes aren't `Equatable` or `Comparable` or anything else, at least not with the same semantics that the `Ref`s would've been.
-If you wanted to sort that scratch array of `Ref`s, you could just do it.
-But to sort that scratch array of indexes, you'd need to provide a comparator that compares elements of the original collection.
-Piece by piece, these kinds of limitations undermine a lot of the usefulness of being able to generalize over non-escapable values in the first place.
+For example, if you wanted to sort the indexes by their value, you wouldn't be able to use the standard `sort` function for `Comparable` elements; you'd have to use a comparator that has access to the original span.
+Algorithms being generalized to work with non-escapable types would need to be rewritten in a less fluent and more boilerplate-y way, not because the existing implementation actually does anything that might escape the value, but just because the language model of non-escapable types is incapable of proving the correctness of the code.
 
-It's also possible that the value-dependency model could be extended with some ability to support multiple kinds of dependency.
-There's an idea that's been sketched out where values can have named nested lifetimes.
-This essentially allows them to act as multiple distinct nodes in the dependency graph.
-However, that idea is very much still just a sketch.
-It may not work, and even if it does, it may not actually add a useful amount of generalization.
+Another solution would be to extend the current value-dependency model in ways that accommodate multiple sources of source restriction.
+Several ideas have been explored for this, generally under the name "nested lifetimes".
+Generally, the idea is that a type can declare one or more lifetime members that can be somewhat independent of the overall value's lifetime dependencies.
+These approaches differ in their exact treatment of these nested lifetimes.
+
+If the nested lifetime can be concretely constrained to a specific scope, this is essentially adopting a type-based model, at least for the nested lifetimes.
+It is somewhat unclear how this would compose with the rules for local values, which would still be following value-dependency rules.
+Values constrained by nested lifetimes can often become available as local values and vice-versa, e.g. when they are read out of a collection, and so it would be important to make them interact correctly.
+For example, if you gain mutable access to a `MutableSpan` of non-escapable values that's stored in a collection, then inserted something into that span, it could add a dependency to the span.
+That would need to be incorporated back into the nested lifetime somehow.
+This could get very complicated, both in the theory and in the implementation.
+It might be more reasonable to just simply switch wholly to a type-based model.
+
+A different approach would be to make the nested lifetimes simply accumulate their own independent set of dependencies, as if they were separate values.
+The dependency signatures of functions would be able to express changes in these dependency sets the same as they can express them for top-level values.
+This is probably workable, and it would allow some more programs to be type-checked.
+But most of the other problems with the value-dependency model would remain.
+
+#### Abstract propagation of scope restrictions
+
+Another major problem with the value-dependency model is the way that scope restrictions propagate through APIs.
+The value-dependency model defaults to being conservative about dependencies.
+For example, return values are assumed to depend on all of the parameters to a function unless otherwise annotated.
+This is appropriate in some cases; in fact, the type-based model applies essentially the same rule for functions that return a non-escaping type with unbound scope restrictions.
+But it is quite over-conservative for common patterns of abstraction over non-escapable values.
+
+Consider an `[Span<Int>]`.
+When the programmer uses this value, there will be some kind of scope restriction that the elements of the array are collectively expected to have.
+This may be an intersection of different scopes, since different elements may have different sources, but that kind of conservatism is inherent to the problem: we cannot reasonably expect Swift to track more specific associations through the abstract indexing API of `Array`.
+
+In the type-based model, this scope restriction will be set (perhaps implicitly) on the argument type of `Array`.
+It will therefore automatically and perfectly transfer by type substitution to everywhere in the `Array` API that refers to its `Element` type parameter.
+This works out such that generic code that works with `Element`s does not actually need to reason about the specific scope restrictions of that type.
+It can freely copy or move the value around wherever it likes (assuming the other constraints on the type permit that), as long as it doesn't statically erase the type (e.g. by wrapping it up as an `Any`).
+This is because the generic function knows that the scope restriction in `Element` cannot refer to any of its own scopes.
+That scope restriction was bound into the type by some function up the stack, using scopes meaningful in that function.
+That function necessarily calls some function during that scope, or else the use would be in violation of its local rules.
+Every function called subsequently, all the way down to the generic function, is therefore wholly contained within that scope, so the data flow of `Element` values no special need to be locally restricted within the function.
+Any context that receives a value statically typed as `Element` (or terms of it) will maintain that same knowledge via type substitution of the original scope restriction.
+Ultimately that propagates all the way back out to the original function that bound `Element`'s scope restriction to some locally-meaningfully scope.
+Whenever that function works with an `Element`, type substitution will replace `Element` with a type containing the actual scope restriction.
+Swift then simply needs to check that the value is only used within that locally-meaningful scope.
+
+The result is that values of non-escapable types are only very lightly restricted by their non-escapability within generic functions.
+As long as their types aren't erased, and they aren't used in some inherently escaping way (like being captured in an escaping function), they're free to be used exactly like escapable values.
+There isn't any way for a function that just works with an `Element` to somehow impose extra scope restrictions on it, because the scope restrictions are bound immutably into the type.
+
+That is not how it works under the value-dependency model.
+Dependencies can get conservatively mixed up on essentially any function call.
+It is up to the dependency signature of each specific function to only report the dependencies that it actually adds.
+Any amount of preemptive caution or generality at any level risks permanently losing information by adding unnecessary dependencies.
+This is a somewhat fraught programming model.
+It is not in any way unsafe, but any failure to minimize dependencies can bring the whole house of cards down and make it impossible to write algorithms that have no business being forbidden.
+
+The `Iterable` protocol proposed by [SE-0516][] provides an excellent example of this.
+The protocol defines an `IterableIterator` associated type which is allowed (actually expected) to be non-escapable.
+It also defines an `Element` associated type, which we would also like to allow to be non-escapable in order to support collections of non-escapable values.
+
+Now, the protocol requires an `Iterable` value to have a `makeIterableIterator` method.
+Whenever you call this method, you must borrow the collection value, and the iterator it returns should only be used within the scope of that borrow.
+The value-dependency model has no problem expressing this scope restriction.
+Different calls will be restricted to different borrow scopes.
+Nothing about the type of the collection has anything to say about the scope of the iterator, nor should it.
+
+The iterator thus produced is now required to have a `nextSpan` method that returns back a `Span<Element>`, and this is where the model runs into a problem.
+What is the scope restriction of the elements of this span?
+
+In the current model, lacking nested lifetimes, there is only one option.
+The elements must shared the same dependencies as the span.
+Since we want to allow the span to be temporary to the current call to `nextSpan`, the elements are also restricted to that call.
+This means that elements cannot safely be persisted across calls to `nextSpan()`.
+When the iterator is used for a `for` loop, this means that elements cannot be stashed between iterations of the loop, much less stashed outside of the loop.
+This is extremely restrictive and applies even if the element type is known to be copyable.
+
+Essentially, this option is permitting the iterator to not just synthesize a span in temporary memory in the iterator, but to synthesize the elements of that span in some way that depends on temporary memory in the iterator.
+This seems admirably general, but it takes some effort to imagine a collection type that could take advantage of the additional flexibility.
+A permutation iterator, maybe, where the elements are spans of values.
+The cost of this generality is that iteration over anything approaching a normal stored collection of non-escapable values cannot use `Iterable` without facing heavy restrictions.
+
+Now, still under the current model, a refinement of `Iterable` could say that the spans returned by `nextSpan` depend only on the current iterator value.
+(This would need an explicit annotation.)
+The iterator value will generally only directly depend on the borrow of the collection performed for the call to `makeIterableIterator`.
+Thus both the spans and the elements will depend on that borrow scope.
+This is a significant generalization in some ways.
+Multiple spans can be used at once, and so can elements from different spans.
+This permits some amount of element data flow between iterations.
+But it's still the case that elements are restricted within the borrow of the collection, even if they could reasonably just be copied around as independent values.
+So this refinement still heavily restricts how the element values can be used.
+
+To do better, we would need nested lifetimes.
+With these, we can give collections, iterators, and spans a nested lifetime corresponding to the elements.
+In the signature for `makeIterableIterator`, we need to say the iterator's element lifetimes depend only on the collection's.
+Similarly, in `nextSpan`, we need to say that the the element lifetime of the span depened on the iterator's element lifetime.
+Finally, in `Span`, we need to say on element accessors (like the `subscript`) just returns a value that depends on the span's element lifetime.
+With this careful set of annotations, and a protocol refinement devoted to the purpose, we can make sure that element lifetimes propagate correctly for this specific API --- when we can statically make use of the refinement.
+
+When I compare this to the simple guarantee afforded automatically to all generic code by type substitution, I feel that this is a significant loss in usability for collections (and other abstractions) with non-escapable elements.
+And the best case here already relies on significant extensions (and widespread adoption thereof) beyond what the current value-dependency model is capable of expressing.
 
 #### Lack of explicit local annotations
 
@@ -515,12 +544,14 @@ What I think we clearly need at start is at least:
 To this we could gradually add member paths, intersections, scopes of local variables, and so on.
 We'll probably need to support most of those in the implementation right away --- they can come up in scope inference very easily --- but we don't necessarily need user-facing syntax for them.
 
-### Applied and unapplied non-escapable types
+### Bound and unbound non-escapable types
 
-Not every place you can write a type is immediately the type of a value.
-Forcing such a type to always carry scope restrictions would rule out code that we don't want to rule out.
+We've said that the types of values must always specify any concrete scope restrictions in the type.
+Such a type is said to be *bound*.
+But not every place you can write a type is immediately the type of a value.
+Forcing every non-escapable type to always be bound to a specific scope restriction would rule out a lot of useful code patterns.
 
-We can see this directly with a `typealias`:
+This is straightforward to see with a simple `typealias`:
 
 ```swift
 typealias ISpan = Span<UInt32>
@@ -528,12 +559,9 @@ typealias ISpan = Span<UInt32>
 func slice(span: ISpan) -> ISpan { ... }
 ```
 
-We could try to interpret this by inferring a scope restriction to apply to all uses of `ISpan`.
+If all references to a non-escapable type had to bind the type's scope restrictions, every use of `ISpan` would share the same scope restriction.
 That's probably not want the programmer wants, though.
-They probably want writing `ISpan` to behave just like they'd written `Span<UInt32>`.
-That is, they want this use of `Span` to stay *unapplied* to a scope restriction so that a scope restriction can be decided from context in the usual way.
-
-If they did want `ISpan` to apply a common scope restriction, they could just write the scope restriction directly in the `typealias`, like so:
+If that's what they wanted, they could've written the scope restriction explicitly in the `typealias`, like so:
 
 ```swift
 typealias ISpan = @scoped(immortal) Span<UInt32>
@@ -541,7 +569,11 @@ typealias ISpan = @scoped(immortal) Span<UInt32>
 func slice(span: ISpan) -> ISpan { ... }
 ```
 
-This divide between applied and unapplied types is very important in the type-based model.
+What they probably want is for writing `ISpan` to behave just like an abbreviation of writing `Span<UInt32>`.
+In other words, they want the reference to `Span` in the alias to stay unbound.
+When they use `ISpan` in a context that requires scope restrictions to be bound, they can provide the scope restrictions themselves or just allow them to be decided from context exactly as if they'd written `Span<UInt32>`.
+
+This divide between bound and unbound types is very important in the type-based model.
 That's especially true for abstract positions like generic parameters and associated types.
 With `typealias`es, Swift can really muddle through well enough using any rule; the compiler can always locally choose to look through the `typealias` or throw away scope restrictions if it helps make reasonable code compile.
 With the generic positions, Swift really needs to know what the programmer wants, because it's not reasonable for the compiler to do some global analysis of how a generic parameter is used to figure it out.
@@ -558,23 +590,23 @@ protocol Iterable<Element>: ~Copyable, ~Escapable {
 }
 ```
 
-The `Element` associated type almost certainly ought to be an applied type.
+The `Element` associated type almost certainly ought to be a bound type.
 This would rule out some largely theoretical conformances --- types that synthesize non-escapable elements during each call to `nextSpan`  --- while promoting a very clean, unrestricted programming model for standard conformances when they're generalized to support non-escapable elements.
-This is because applied types provide a very straightforward generic model.
-The applied scope restriction must be derived somehow from the type of `self`, which means the scope in the restriction must always be broader than the current function call.
-Any context that expects a value of the applied type will have its own contextually-equivalent understanding of the scope restriction expressed in the element type.
-This all means that generic code can usually move and copy values of applied types around freely, subject only to fairly minor restrictions, like not doing truly escaping things like e.g. wrapping them up as an `Any`.
+This is because bound types provide a very straightforward generic model.
+The bound scope restriction must be derived somehow from the type of `self`, which means the scope in the restriction must always be broader than the current function call.
+Any context that expects a value of the bound type will have its own contextually-equivalent understanding of the scope restriction expressed in the element type.
+This all means that generic code can usually move and copy values of bound types around freely, subject only to fairly minor restrictions, like not doing truly escaping things like e.g. wrapping them up as an `Any`.
 That's a very strong and desirable property for collection elements in generic code.
 
-In contrast, unapplied types tend to end up with highly conservative scope restrictions that make them dependent on specific calls and accesses rather than allowing broad data flow limited only by the type.
+In contrast, unbound types tend to end up with highly conservative scope restrictions that make them dependent on specific calls and accesses rather than allowing broad data flow limited only by the type.
 This is necessary for types like `IterableIterator`, where the protocol really does need clients to infer a different scope restriction for every unique call to `makeIterator`.
 
 Since there are use-cases for both, it's necessary to have a syntax for declaring generic parameters and associated types as either.
-At the moment, I believe that the right default is for these positions to expect an applied type.
-Unapplied types therefore ought to be called out when they're needed.
+At the moment, I believe that the right default is for these positions to expect an bound type.
+Unbound types therefore ought to be called out when they're needed.
 
-I'm not sure what the right syntax for unapplied types would be.
-In general, unapplied types aren't merely "unapplied": there's an expected signature for the scope restrictions that need to be applied to them.
+I'm not sure what the right syntax for unbound types would be.
+Considered in full generality, unbound types aren't merely "unbound" as binary flag: there's a whole expected signature for the scope restrictions that need to be applied to them.
 This is effectively a very restricted form of higher-kinding in the type system.
 I would guess that we don't really need to support more than the simple pattern of a single scope restriction, though.
 An attribute like `@unscoped` on the generic parameter or associated type might be fine for that.
@@ -664,6 +696,12 @@ In the examples that follow, let `smaller` and `bigger` be two scopes such that 
   But `MutableSpan` is invariant in its type parameter, so `@scoped(x) MutableSpan<@scoped(smaller) Span<Int>>` is not related to `@scoped(x) MutableSpan<@scoped(larger) Span<Int>>`.
   We would need syntax for declaring this.
   I believe Rust has a defaulting rule for it, but I think it's based on a deep inspection that I'm not sure we want to do.
+
+
+- higher rank
+- scope specifiers on borrowing/inout
+- stdlib Scope values for explicit arguments
+- captures
 
 ## Proposed engineering plan
 
