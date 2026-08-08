@@ -1,4 +1,6 @@
-# Models for scope restrictions for non-escaping types in Swift
+# Scope and lifetime restrictions in Swift
+
+This document tries to describe the current state of lifetime dependencies in Swift, make a case for switching to a new type-driven model of scope restrictions, lay out some of the complexity and future directions of the new model, and give a preliminary sketch for how the switch could be carried out.
 
 ## Introduction
 
@@ -149,15 +151,15 @@ The compiler does some very impressive things, especially around shrinking and e
 And it's worth noting that almost all of that work would still be necessary if Swift switched to a different language model.
 The analysis parts of it would just get consumed in a different way, and the rewriting parts should be exactly the same.)
 
-### Problems with the value-dependency model
+## Problems with the value-dependency model
 
-#### Conflation of different scope restrictions
+### Conflation of different scope restrictions
 
 The current value-dependency model does not have the ability to distinguish different kinds of lifetime dependency.
 This is unfortunate because values may naturally have scope restrictions for multiple independent reasons.
 
 Consider a `Span` of non-escapable values.
-There is a natural scope restriction associated with the borrow of array that the span refers to.
+There is a natural scope restriction associated with the borrow of the array that the span refers to.
 The elements stored in that array also came from some scope, almost certainly a different scope.
 So the scope restrictions are almost certainly different.
 But in the value-dependency model, the span value must have the union of those dependencies, and so much any element extracted from it.
@@ -187,7 +189,7 @@ extension Collection where Element: ~Copyable & ~Escapable {
 }
 ```
 
-Here the algorithm has been generalized to permit a return value of arbitrary type.[^10]
+Here the algorithm has been generalized to permit a return value of arbitrary type.[^8]
 Unfortunately, there's a problem with this.
 The `operation` closure is a non-escaping function, as it should be, since `firstReturning` doesn't plan to escape it.
 But that means that, when we call it within `firstReturning`, its return value is naturally going to gain a dependency on the closure.
@@ -200,7 +202,7 @@ So you could not, for example, use `firstReturning` to implement a function like
 ```swift
 extension Collection where Element: ~Copyable & ~Escapable {
   func firstRefMatching<R>(predicate: (borrowing Element) -> Bool) -> Ref<Element>? {
-    // The closure we pass as `operation` is temporary in this function,
+    // The closure we pass as `predicate` is temporary in this function,
     // so when the `Ref` ends up dependent on it, it means we can no longer
     // return it out of this scope.
     firstReturning { element in predicate(element) ? Ref(element) : nil }
@@ -208,7 +210,7 @@ extension Collection where Element: ~Copyable & ~Escapable {
 }
 ```
 
-[^10]: Swift's existing `Collection` protocol probably can't be retroactively generalized to support non-`Copyable` or non-`Escapable` elements.
+[^8]: Swift's existing `Collection` protocol probably can't be retroactively generalized to support non-`Copyable` or non-`Escapable` elements.
        But we obviously want there to be *some* protocol that can do so, so drop that in instead.
        I'm just using `Collection` for familiarity.
 
@@ -239,7 +241,7 @@ The dependency signatures of functions would be able to express changes in these
 This is probably workable, and it would allow some more programs to be type-checked.
 But most of the other problems with the value-dependency model would remain.
 
-#### Abstract propagation of scope restrictions
+### Abstract propagation of scope restrictions
 
 Another major problem with the value-dependency model is the way that scope restrictions propagate through APIs.
 The value-dependency model defaults to being conservative about dependencies.
@@ -320,7 +322,7 @@ With this careful set of annotations, and a protocol refinement devoted to the p
 When I compare this to the simple guarantee afforded automatically to all generic code by type substitution, I feel that this is a significant loss in usability for collections (and other abstractions) with non-escapable elements.
 And the best case here already relies on significant extensions (and widespread adoption thereof) beyond what the current value-dependency model is capable of expressing.
 
-#### Lack of explicit local annotations
+### Lack of explicit local annotations
 
 Another disadvantage of the current value-dependency model is that it provides no direct way to state the expected scope restrictions on a specific value.
 A function's dependency signature can say that its return value is dependent on a particular parameter.
@@ -369,7 +371,7 @@ Instead, it will report an error on line 5, when a non-immortal span is assigned
 (Of course, this isn't an excuse for compiler developers to not still try to emit the better diagnostic.)
 
 Finally, explicit annotations can help to enforce correctness when interacting with an unsafe interface.
-In safe code, the compiler will analyze both tbe uses of a value and how it's defined.
+In safe code, the compiler will analyze both the uses of a value and how it's defined.
 This creates a complementary balance: the narrower the scope restriction that the compiler infers for the value, the more restricted the uses of the value will be.
 But with unsafe code, the compiler often just has to trust one side or the other, eliminating this balance.
 An explicit annotation can make sure that the compiler still enforces the assumptions that the unsafe code requires.
@@ -380,7 +382,7 @@ Now suppose that some safe Swift code computes a span with the goal of passing t
 Without an annotation, a bug in that computation can result in a span with a narrower than expected scope, silently causing the pointer to not meet the documented restriction.
 But an explicit annotation of the required scope of the span prior to extracting the pointer from it will not just document the expectation in source, it will actually enforce it: the compiler will object if a too-narrow span is ever assigned to the explicitly-annotated variable.
 
-#### Flow-sensitive diagnostics for invariant lifetime requirements
+### Flow-sensitive diagnostics for invariant lifetime requirements
 
 This last disadvantage is significant enough to be worthy of inclusion.
 I will readily acknowledge that it is less important than the others, though.
@@ -410,7 +412,7 @@ Even if it does point out the `insert` call, it has to also point out the path t
 After all, the bug might not be that `insert` was called; it might just be that the value was expected to be reset later.
 It is just fundamentally harder to provide a good, concise diagnostic under this rule.
 
-### Advantages of the value-dependency model
+## Advantages of the value-dependency model
 
 None of that is to say that there aren't upsides to the value-dependency model.
 
@@ -704,30 +706,128 @@ However, it is still the case that the system is purely conjunctive.
 
 And finally, the type-based model must reason about scope variance relationships between various types.
 
-### Scope variance
+### Scope relationships and scope variance
 
-Scopes have natural relationships with each other: some scopes are contained within others.
-Two scopes can also always be intersected, although this may produce an empty scope.
+Scopes have natural relationships with each other: a scope can be a *subscope* of another, meaning that its duration is contained within the other's duration.
+Two scopes can also always be intersected, and the resulting scope is a subscope of both of the original scopes.
+Mathematically, we can say that scopes form a bounded meet-semilattice, with the immortal global scope as the greatest element.
 
-There is a closely related subtyping relationship between types that carry concrete scope restrictions.
-This system of scope variance preserves a lot of the flexibility of the value-dependency model under the type-based model, because it allows for scopes to be naturally shrunk until they can be merged.
-For example, in the scope-dependency model, when you insert spans into an array, the spans are not required to have exactly the same dependencies.
-Instead, the array value accumulates dependencies from each of those spans.
-In the type-based model, the element type of the array does have to have a consistent scope restriction.
-However, that scope restriction is typically a variable that must be inferred.
-Whenever a span is inserted into the array, it creates a constraint that the type of that span must be a subtype of the type of the element, and thus that the scope restriction in that span's type must be a superscope of the scope restriction of the element type.
-The scope restriction of the element type will thus be inferred to be an intersection of the scope restrictions of the spans, imposing an essentially similar overall constraint as was imposed by the value-dependency model.
+In principle, the intersection of any two scopes might be empty, if they do not overlap at all.
+But this is not a useful result, because a programming language is only interested in the values that are usable at a particular point in the program.
+Every scope that can be used at a particular point should contain that point, and so the intersection between such scopes must also contain that point.
+Generally, if a scope intersection would end up being empty, it must be an error.
 
-In the examples that follow, let `smaller` and `bigger` be two scopes such that `bigger` contains `smaller`.
+#### Natural subtyping of scope restrictions
 
-- Every non-escaping type is covariant with respect to its immediate scope specifiers.
-  For example, `@scoped(smaller) Span<Int>` is a subtype of `@scoped(bigger) Span<Int>` because `smaller` is contained within `larger`.
+This relationship between scopes also implies a relationship between types that carry concrete scope restrictions.
+Suppose that `smallScope` is a subscope of `bigScope`.
+A span that's restricted to `bigScope` can safely be used as if it were restricted to `smallScope` instead.
+Code that satisfies the narrower restriction of `smallScope` automatically satisfies the looser restriction of `bigScope` at the same time.
+Another way of thinking about this is that knowing that the span is valid for all of `bigScope` provides strictly more information than only knowing that it's valid for `smallScope`.
+These properties make `@scoped(bigScope) Span<T>` a natural subtype of `@scoped(smallScope) Span<T>`.
+Converting a value of the former to a value of the latter removes information, but in a way that remains safe.
 
-- Types may be covariant, contravariant, or invariant with respect to their concrete `~Escapable` type parameters.
-  For example, `Span` is covariant in its type parameter, so `@scoped(x) Span<@scoped(smaller) Span<Int>>` is a subtype of `@scoped(x) Span<@scoped(larger) Span<Int>>`.
-  But `MutableSpan` is invariant in its type parameter, so `@scoped(x) MutableSpan<@scoped(smaller) Span<Int>>` is not related to `@scoped(x) MutableSpan<@scoped(larger) Span<Int>>`.
-  We would need syntax for declaring this.
-  I believe Rust has a defaulting rule for it, but I think it's based on a deep inspection that I'm not sure we want to do.
+Because `@scoped(a) Span<T>` is a subtype of `@scoped(b) Span<T>` when `b` is a subscope of `a` (rather than the other way around), `Span` is said to be *contravariant* in its scope parameter.
+Almost all unconditionally non-escapable types are contravariant in their scope parameters.
+This is because the scope parameters of these types generally encode restrictions on where the type's values can be used, and it's always safe to use a value in a narrower scope.
+(Other forms of variance even over immediate scope parameters are possible; I will discuss them later.)
+
+#### Variance of scope restrictions
+
+This subtype relationship between types that arises from scope relationships carries over to generic types with non-escapable type arguments.
+Generic types can be covariant, invariant, or contravariant in their non-escapable type parameters.
+Type variance typically follows the following rule:
+- if a `G<T>` only *produces* values of type `T`, it should be covariant over `T`;
+- if it only *consumes* values of type type `T`, it should be contravariant over `T`; and
+- if it both produces and consumes values, it must be invariant over `T`.
+
+In particular, types with value semantics are naturally covariant in the types of their component values because a value can only *produce* its component values.
+For example, the tuple type `(T, Int)` is a subtype of `(U, Int)` if `T` is a subtype of `U`: all you can ultimately do with such a tuple is break it into its `T` and `Int` elements, and then those elements can be safely used as if they had type `U` and `Int` respectively.
+The same logic applies to a struct `G<T>` that just has a stored property of type `T`.
+It also extends to types like `Array<T>` that logically behave like collections of `T` values, and even to types with immutable reference semantics like `Ref<T>` and `Span<T>`.
+But types that store `T` values with mutable reference semantics, like `MutableRef` and `MutableSpan` can both produce and consume values of type `T`; they therefoer must be invariant over `T`.[^9]
+
+[^9]: Java famously gets this wrong: its built-in array type `T[]` is covariant in `T` despite having mutable reference semantics.
+      This means that, for example, code that converts a `String[]` to `Object[]` and then inserts a non-`String` object will successfully type-check.
+      The soundness of the type system has to be maintained dynamically with a runtime type check whenever you insert into an array.
+
+(Contravariance is relatively uncommon because it is rare to have an abstraction that only consume values of a given type.
+But it does happen with, say, a function value that takes a parameter of type `T`.)
+
+#### Examples of variance
+
+Let's look at that with some concrete types.
+
+Suppose I've got an immutable value of type `UniqueArray<@scoped(bigScope) Span<T>>`.
+Whenever I pull an element out of this array, it's a `@scoped(bigScope) Span<T>`.
+As we've already discussed, it's safe for me to instead use this element as a `@scoped(smallScope) Span<T>`.
+And the only thing I can really do with the span, in terms of its elements, is pull those elements out.
+I can't add new elements to it because I've only got an immutable value.
+So it's actually fine for me to treat this whole array as if it were a `UniqueArray<@scoped(smallScope) Span<T>>` instead.
+This is what we mean by covariance.
+(This conversion would be a problem if spans with different scope restrictions had real differences in their in-memory representation.
+But they don't: this whole system relies on all the scope restrictions being erased at runtime.)
+
+Now suppose instead that I've got a `MutableRef<@scoped(bigScope) Span<T>>`.
+If I read the span out of this reference, I get a `@scoped(bigScope) Span<T>`.
+I can safely use that span as a `@scoped(smallScope) Span<T>`, so you might think that it'd be okay to allow the ref to be converted to `MutableRef<@scoped(smallScope) Span<T>`.
+But this is not safe, because it would let me write a `@scoped(smallScope) Span<T>` into the reference.
+If I do, then any code that subsequently reads from the referenced memory and expects it to hold a `@scoped(bigScope) Span<T>` will become unsound.
+The scope restrictions in the element type cannot be allowed to change.
+This is what we mean by invariance.
+
+#### Usefulness of variance
+
+Note that I'm describing abstract, natural rules of value subtyping here.
+Swift does have a general system of value subtyping, conversion, and variance that applies to some types.
+This system is what permits, e.g., a value of type `Int` to be implicitly converted to type `Int?`.
+However, most types cannot participate in this system; Swift special-cases it for a handful of fundamental and library types.
+This is because, in general, subtypes might have a different in-memory representation from their supertypes.
+Applying these natural subtyping and variance rules to an arbitrary user-defined type would therefore require recursively transforming values of the type.
+This would be complex, expensive, prone to source-compatibility problems, and typically not very useful.
+But subtyping arising from scope restrictions is different because it just results in use restrictions and never affects in-memory representations.
+We very badly want the implementation to be able to use an *erasure* rule where the scope restrictions have no runtime representation.
+Since the in-memory representations don't change, the subtype conversion has no runtime effect and therefore no compiler complexity beyond checking the correctness rules.
+
+Moreover, subtyping in scope restrictions is very convenient because it implicitly gives programs a lot of flexibility about the exact scopes involved.
+For example, consider a function that takes two spans and returns a slice of one of them, chosen dynamically.
+Subtyping of scope restrictions naturally allows the spans to come from different places; the return value just has to be conservatively restricted to the intersection of the two scopes.[^10]
+Without subtyping, this would have to be rejected.
+
+[^10]: This intersection doesn't even need to be explicit.
+       The function can simply say it takes two spans of scope `s` and returns a span of scope `s`.
+       If the caller passes two spans of different scopes, the compiler will have to find a common supertype between them.
+       This will be a span with the intersection of those two scopes.
+
+In addition to being useful as a way to accept more valid programs, scope subtyping is specifically important for achieving expressive parity with Swift's current value-dependency model.
+When the compiler is checking whether a function's implementation satisfies its dependency signature, it permits values to have fewer dependencies than the signature allows.
+Translating such a situation into the typing constraints introduced by type-based scope restrictions introduces a type mismatch that requires scope subtyping to resolve.
+Providing at least simple value subtyping is therefore necessary in order to continue to accept programs that the current model easily accepts.
+
+#### Invariance and covariance of immediate scope parameters
+
+As mentioned above, almost all unconditionally non-escapable types are naturally contravariant over their scope parameters because the parameter represents a restriction on where the value can be used.
+When the parameter represents something else, however, other variances are possible.
+Typically this arises when the scope constraint is applied to a value that is not just a value-semantics component of the type.
+
+For example, consider a type that stores a mutable reference to a span:
+
+```swift
+struct SMR<T> {
+  let ref: MutableRef<Span<T>>
+}
+```
+
+We have two levels of scope restriction here, which we can make explicit:
+
+```swift
+struct SMR<scope r, scope s, T> {
+  let ref: @scoped(r) MutableRef<@scoped(s) Span<T>>
+}
+```
+
+`SMR` is contravariant in the scope parameter `r`: it's always fine to use the ref as if it were constrained to a narrowing scope than it actually is.
+But it must be invariant in the scope parameter `s`, because narrowing this scope would allow a span with a narrower scope to be written into the reference.
 
 ### Standard library Scope type
 
@@ -764,19 +864,136 @@ Span(wrapping: buffer, in: @scoped(&self) Scope())
 
 Both the type and the initialization syntax could be sugared, of course.
 
-### Function values that are polymorphic over scopes
+### Non-escapable values and first-class functions
 
-(to be written)
+What does it mean to have a function that takes or returns a non-escaping value?
 
-### Closure captures
+For standalone functions, this is often fairly unambiguous from the overall function signature.
+Parameter values are restricted in scope.
+They must not be stored into memory that does not carry the scope restriction, or else the language will not be able to keep them restricted in scope.
+Only other parameters can carry the correct scope restriction.
+Results must be trivial (e.g. an empty span) or else derived in some way from the parameters.
+Non-trivial results cannot come from memory that does not carry the scope restriction, because to be in that memory in the first place, those values would have needed to escape there.
 
-(to be written)
+None of that reasoning works for first-class function values, such as closures (anonymous functions).
+The caller of a function that takes a closure parameter knows, locally, what the scope arguments of the call are.
+It can therefore soundly do things with non-escapable parameters and results in the closure that a standalone function could not do.
 
-## Sketch of an engineering plan for switching
+For example, consider a function that generates all of the prefix spans of an array, passing them to a callback:
+
+```swift
+func generatePrefixes(from array: Array<Int>,
+                      into callback: (Span<Int>) -> Void)
+```
+
+A standalone function with the signature `(Span<Int>) -> Void` must only use the span locally.
+Unless it specifically requires an *immortal* span, it must not care what scope the span is restricted to, because there is no other scope it could possibly know about.
+Therefore it is reasonable to assume that it is generic over the scope of the span it receives.
+
+But an arbitrary function value with this signature does not have this limitation.
+The callback *might* just use the span locally, in which case it could reasonably be generic over the scope of the span.
+If we wanted `generatePrefixes` to insist on this, we could force the callback to be generic over the scope, like so:
+
+```swift
+func generatePrefixes(from array: Array<Int>,
+                      into callback: (<scope s> @scoped(s) Span<Int>) -> Void)
+```
+
+But there's no reason for `generatePrefixes` to do that.
+The spans passed to the callback are derived from the borrowed `Array` parameter, which means they all have a restriction to that borrow scope.
+That is, we really want to say:
+
+```swift
+func generatePrefixes(from array: Array<Int>,
+                      into callback: (@scoped(array) Span<Int>) -> Void)
+```
+
+And the caller of `generatePrefixes` can actually use that fact.
+After all, it knows something locally about what the scope of the borrow is.
+There's no reason that the callback function passed in here shouldn't be able to save one or more of the spans, as long as they're still used within that borrow:
+
+```swift
+let array = [2,4,7,13]
+var spans = [Span<Int>]()
+generatePrefixes(from: array) { span in
+  guard span.allSatisfy { $0.isMultiple(of: 2) } else { return }
+  spans.append(span)
+}
+print(spans) // okay because we can extend the borrow of `array`
+```
+
+So there's an important difference here.
+Type-based scope restrictions give us an excellent way to talk about this difference, as well to express further gradations like exactly which enclosing scope the value depends on.
+But the compiler can't reasonably choose a default, the way it might for a standalone function, without an intelligent understanding of how all the values interact.
+
+Similarly, a standalone function that returns a non-escapable value must somehow derive it from one of its parameters.
+Furthermore, as we already discussed, it must be generic over the scopes of those parameters.
+But an arbitrary function value could reasonably derive it from something else that the function has access to.
+Again, this can be sound because of the caller's local understanding of all the scopes involved.
+For example:
+
+```swift
+func operateOnSpans<scope s>(fromGenerator gen: () -> @scoped(s) Span<Int>)
+
+let span = ...
+operateOnSpans {
+  guard !span.isEmpty else { return span }
+  span = span.extracting(droppingLast: 1)
+  return span
+}
+```
+
+Here, `operateOnSpans` might well care about the fact that the spans all have the *same* scope restriction.
+This would allow it to save and work with multiple span values, not just the last one returned by the callback.
+But it could also depend on parameters, if there were any.
+Another alternative would be that it returns a fresh span each time, which may be invalidated by the next call.
+(For example, it might be building a value in a common buffer, then return the current state of that.)
+That would be useful, but it's not immediately obvious to me how to express that, even with type-based scope restrictions.
+
+Some of these expressive possibilities rely on having first-class function values that are generic over scopes.
+This would be a kind of higher-rank polymorphisms, albeit restricted to scope polymorphism.
+Rust, notably, made do for many years without the ability to express this, and it's quite possible that Swift could as well.
+On the other hand, Swift does rely on higher-order programming quite a bit in its API designs, so we might come to see it as necessary sooner than Rust did.
+Also, most of the challenges with supporting this are with type representations in the compiler.
+If Swift figures out a solution for higher-rank scope generics, it would likely lave the way for supporting higher-rank generic functions in general.
+This would be very useful for some APIs (a recent example came up in [SE-0526]), although there are also some good reasons to avoid it.
+
+### Flow-sensitive refinement of scope restrictions
+
+The value-dependency model reasons about a local variable of non-escapable type using the abstract values that the variable takes on over the course of the function.
+Different abstract values can have different dependencies.
+As a result, the model is capable of flow-sensitive reasoning: if the value of a variable has fewer dependencies at a particular point in the program, Swift is more permissive about how the variable can be used there.
+
+For example, consider a variable that holds an array of spans.
+At first, the abstract value in the variable is an empty array and has no dependencies.
+Uses of the variable at this point will always satisfy dependency checking.
+If the program later calls `append` to add a span to the array, the new abstract value of the variable will have exactly the scope dependencies of that span value.
+Uses of the variable can now only satisfying dependency checks that are compatible with that.
+If another span is subsequently added to the array, the new abstract value will have the union of the scope dependencies of the two span values, and uses will be further restricted.
+
+This does not naturally translate into the type-based model because variables normally have a fixed type across their entire scope.
+If the variable is not declared with a specific scope restriction, the restriction will be inferred by finding a scope that makes all of the `append` calls valid.
+Generally, this will be the intersection of the scope restrictions of the individual spans.
+This scope restriction becomes part of the type of the variable, and all loads of the variable will have that same type.
+Effectively, this makes the model more conservative: restrictions introduced by later changes to the variable end up being "backdated" to apply to earlier uses of it.
+
+It's unclear how often Swift programs today actually require this permissiveness in order to satisfy the dependency checker.
+It may be vanishingly uncommon.
+If so, the type-based model can achieve *de facto* parity with the value-dependency model without worrying about this problem.
+
+On the other hand, if we decide that it's necessary to make code like this compile, it is possible to express it using type-based rules.
+The scope restrictions in the variable's type just need to be *refined* over the course of its scope.
+Effectively, different abstract values of the variable would observe different types.
+Whenever the data flow of the function links two abstract values (such as one being produced by mutating another), the earlier value is required to be a subtype of the later value.
+Of course, this would require a more expensive and complex analysis in order to infer scope restrictions: both the control flow graph and the data flow of the variable need to be computed in order to identify the abstract values it takes on.
+
+## Engineering planning sketch for adopting a type-based model
 
 If we accept that we should switch to the type-based model of scope restrictions, we will need a plan for how to pull that off.
 Unfortunately, the models are subtly different, and neither can be considered a true superset of the other.
 Nor do they interact especially well at a formal level; I do not think it would be a good idea to try to implement both.
+
+### Future-proofing evolution
 
 In the short term, we should avoid adding more features to Swift that would make it harder to maintain source compatibility in the long term if Swift switches to a purely type-based model.
 Most importantly, this means not generalizing any generic parameter or associated type to allow non-`Escapable` types if we would want that type to be a bound type in the long term.
@@ -784,12 +1001,82 @@ That includes the `Element` associated type of any collection-ish protocols, suc
 It also includes the generic type parameter of any collection-ish generic types, including `Span`, `Ref`, and the unsafe pointers.
 (`Optional` and `Result` were already generalized in Swift 6.2, and we'll just have to deal with that somehow.)
 
-Note that it is specifically not a problem to introduce `Iterable`, despite it having a non-escapable `IterableIterator` associated type.
+Note that it is specifically not a problem to accept [SE-0516][]'s `Iterable` protocol, despite it having a non-escapable `BorrowingIterator` associated type.
 This is because that associated type would not be a bound type under the type-based model.
 Iterators pick up their (non-`Element`) scope restrictions from the borrows of `self` performed for calls to `makeIterableIterator`, not from the type of the collection.
 The problem is only in generalizing `Iterable` to allow non-escapable element types.
 
-Andrew Trick is preparing a separate paper for the rest of the engineering plan.
+### Overall implementation plan
+
+The type-based model will not immediately supplant the value-dependency model.
+Code will continue to be compiled that uses the value-dependency model.
+In the short term, the type-based model will need to be opt-in using an experimental feature flag.
+The compiler will therefore need to support implementations of both models.
+Sharing as much code as reasonably possible will be vital in order to keep this manageable.
+
+Since library code can be built using either model, both models will have to have some strategy for interpreting function signatures from modules compiled under the other model.
+Interpreting value-dependency signatures in the type-based model should be relatively straightforward, although it may be somewhat more conservative.
+Interpreting type-based signatures in the value-based model will likely be difficult in the general case, and it may be necessary to prevent certain APIs from being used.
+This should not be a problem as long as it doesn't apply to any existing library APIs.
+
+Hopefully, it will become possible at some point to implement the value-dependency model on top of the type-based model, possibly with a small number of tweaks.
+The implementations should then be fully united.
+
+Once the Language Steering Group has decided that the type-based model has achieved adequate expressive parity with the value-dependency model, they can initiate the deprecation period for the latter.
+The requirements of this process were laid out in the announcement of the [lifetime dependencies supported experimental feature][https://forums.swift.org/t/experimental-support-for-lifetime-dependencies-in-swift-6-2-and-beyond/78638].
+In particular, this requires the creation of tools (perhaps compiler-based) to help programmers migrate to the new type-based feature.
+Eventually, the LSG may approve the removal of the old feature and any associated implementing code.
+
+### Checking strategy
+
+The type-based model is essentially adding logic to Swift's type checker.
+However, that logic is substantially different from the existing logic in that it must be function-global.
+Even putting aside the future direction of flow-sensitive type refinement, the inferred scope restriction of a variable must consider all operations on the variable.
+This is not possible with the structure-by-structure walk of the normal type checker.
+Changing the type checker to operate function-global is not workable; we cannot increase the pressure on a system that is already one of the most over-burdened parts of the compiler.
+
+Fortunately, we believe checking can be broken down into phases:
+
+1. The main type-checking walk resolves types *without* scope restrictions for all structures in the function body.
+
+2. After the entire body is type-checked, the scope-resolution analysis augments all of those types with scope specifiers.
+
+3. Finally, uses of scope-restricted values are checked to ensure that they are appropriately nested within local scopes, potentially shortening or lengthening scopes when necessary to make that work.
+
+Phase 3 is basically the "second half" of the current dependency-checking pass.
+If restrictions to local scopes can be turned into SIL dependencies, it is likely that the existing pass can be largely reused for this.
+The SIL passes do not need to do anything to check values that are restricted to abstract scope parameters, since those scopes necessarily include the entire current function.
+
+Phase 2 is the bulk of the new analysis required for the type-based model.
+Essentially, it will collect a set of unresolved "scope variables" for all of the bound types in the function and then build a constraint system to infer concrete scope bindings for those variables.
+This constraint system will ultimately be a set of subscope relationships derived from subtype relationships between values according to their use.
+
+It is an open question whether these unresolved scope variables are introduced during Phase 1 or Phase 2.
+If they're introduced in Phase 1, they will naturally be propagated by the substitution in the constraint solver, and the constraint solver can potentially just have the subtype relationships as a secondary output that gets collected for Phase 2.
+However, the constraint solver will also have to deal with the existence of all these unresolved scope variables, including sometimes introducing them.
+Introducing the variables in Phase 2 would avoid that, but only by creating a bunch of its own problems.
+Every resolution, substitution, and type propagation performed by the constraint solver will need to be repeated in the Phase 2 analysis, this time including the scope specifiers.
+
+Phase 2 will initially be performed in Sema, which means it will not have a CFG or data-flow analysis available.
+This means it will not be able to do flow-sensitive refinement.
+That's fine for now.
+If we decide refinement is necessary, we'll need to move Phase 2 into a SIL pass, which would be a major rewrite.
+However, we should at least have a solid set of test cases in place.
+
+### Type representations
+
+The type and signature representations used in the compiler's AST and type-checker will need to be extended to record scope parameters and scope specifiers.
+Scope specifiers are likely to be the most invasive part of this, since they will be necessary on many types that normally do not have this kind of structure, like (otherwise) non-generic nominal types.
+It is an open question whether scope parameters and arguments should be modeled as part of the generic signature and substitutions, implying that non-escapable types are essentially always generic, or as a separate thing.
+Unifying them makes some sense and would fit more cleanly into the existing system of substitution and mapping in and out of context.
+Keeping them separate would make it easier to isolate the handling of scopes within the typechecker.
+It would also offer a temptingly simple solution to the problem of representing these types in SIL.
+
+The Swift optimizer team is currently thinking that they do not want scope specifiers to be explicit in the types used in the SIL pipeline.
+Reflecting these scope specifiers into SIL would add significant overhead and conceptual complexity to SIL, very similar to the burdens caused by local archetypes.
+SIL passes are generally conservative about changing access scopes, so preserving the exact scope-specific information is unlikely to be necessary to achieve correctness.
+Optimizations are also unlikely to use the scope information for performance purposes in the short- to medium-term, and there may be other ways to represent it when they decide to.
+SILGen therefore only needs to represent enough information in SIL to allow the Phase 3 scope-checking pass to correctly handle any local scope dependencies that occur within the function.
 
 [SE-0176]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0176-enforce-exclusive-access-to-memory.md
 [SE-0414]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0414-region-based-isolation.md
@@ -797,3 +1084,4 @@ Andrew Trick is preparing a separate paper for the rest of the engineering plan.
 [SE-0516]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0516-borrowing-sequence.md
 [SE-0519]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0519-ref-mutableref-types.md
 [SSA]: https://en.wikipedia.org/wiki/Static_single-assignment_form
+[SE-0526]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0526-deadline.md
