@@ -1023,7 +1023,7 @@ Hopefully, it will become possible at some point to implement the value-dependen
 The implementations should then be fully united.
 
 Once the Language Steering Group has decided that the type-based model has achieved adequate expressive parity with the value-dependency model, they can initiate the deprecation period for the latter.
-The requirements of this process were laid out in the announcement of the [lifetime dependencies supported experimental feature][https://forums.swift.org/t/experimental-support-for-lifetime-dependencies-in-swift-6-2-and-beyond/78638].
+The requirements of this process were laid out in the announcement of the [lifetime dependencies supported experimental feature](https://forums.swift.org/t/experimental-support-for-lifetime-dependencies-in-swift-6-2-and-beyond/78638).
 In particular, this requires the creation of tools (perhaps compiler-based) to help programmers migrate to the new type-based feature.
 Eventually, the LSG may approve the removal of the old feature and any associated implementing code.
 
