@@ -950,13 +950,71 @@ Another alternative would be that it returns a fresh span each time, which may b
 (For example, it might be building a value in a common buffer, then return the current state of that.)
 That would be useful, but it's not immediately obvious to me how to express that, even with type-based scope restrictions.
 
+#### Higher-rank scope polymorphism
+
 Some of these expressive possibilities rely on having first-class function values that are generic over scopes.
-This would be a kind of higher-rank polymorphisms, albeit restricted to scope polymorphism.
-Rust, notably, made do for many years without the ability to express this, and it's quite possible that Swift could as well.
-On the other hand, Swift does rely on higher-order programming quite a bit in its API designs, so we might come to see it as necessary sooner than Rust did.
-Also, most of the challenges with supporting this are with type representations in the compiler.
-If Swift figures out a solution for higher-rank scope generics, it would likely lave the way for supporting higher-rank generic functions in general.
-This would be very useful for some APIs (a recent example came up in [SE-0526]), although there are also some good reasons to avoid it.
+In PL theory, this is known as higher-rank polymorphism.[^11]
+Here it would be restricted to polymorphism over scopes.
+
+[^11]: Not to be confused with higher-*kinded* polymorphism.
+
+       Polymorphic types can be thought of as having a *universal quantifier*, which in Swift is written as a generic parameter list, like `<T: Hashable>`.
+
+       Higher *rank* means that the quantifier is allowed in nested positions in another type.
+       In the following code, `<U>` is in a higher-rank position, meaning that `foo` takes a function which is itself generic.
+
+       ```swift
+       func foo<T>(fn: <U> (U) -> T) -> [T]
+       ```
+
+       Higher *kind* means that the quantifier allows generic parameters to still themselves be generic.
+       In the following code, the generic parameter `T` is constrained to be a generic type, which can then be applied to different generic arguments at different positions in the function signature:
+
+       ```swift
+       func bar<T<U>>(value: T<Int>) -> T<String>
+       ```
+
+       These are very different things; the only similarity between them is the name.
+
+Higher-rank scope polymorphism is important for expressing APIs such as [`withTemporaryAllocation`][SE-0524]:
+
+```swift
+public func withTemporaryAllocation<T: ~Copyable, R: ~Copyable, E: Error>(
+  of type: T.Type,
+  capacity: Int,
+  _ body: (inout OutputSpan<T>) throws(E) -> R) throws(E) -> R
+```
+
+The `OutputSpan` is allocated in a scope internal to the execution of `withTemporaryAllocation`.
+In the type-based model, this scope cannot be a scope parameter of `withTemporaryAllocation` because that would make it external to the call, not defined within it.
+The correct way to model this is by requiring `body` to be generic over the scope:
+
+```swift
+public func withTemporaryAllocation<T: ~Copyable, R: ~Copyable, E: Error>(
+  of type: T.Type,
+  capacity: Int,
+  _ body: <scope s> (inout @scoped(s) OutputSpan<T>) throws(E) -> R) throws(E) -> R
+```
+
+This forces the parameter function to accept a span of *any* scope.
+`withTemporaryAllocation` can then pass in a span scoped internally to itself.
+
+This sort of callback with a temporary value is a major use pattern for non-escapable types.
+Supporting higher-rank scope polymorphism is therefore a mandatory part of implementing the type-based model.[^12]
+
+[^12]: I have seen it said that Rust made do without this feature for several years.
+       This appears to be a misunderstanding; thank you to Aviva Ruben for this clarification.
+       Rust's function traits did not allow traits to be polymorphic over scopes until [RFC 387](https://rust-lang.github.io/rfcs/0387-higher-ranked-trait-bounds.html) in 2014.
+       However, Rust's legacy closure types supported scope polymorphism well before this.
+       So it wasn't impossible to provide safe callback APIs, it just required using boxed function values.
+       Not ideal, of course, but still completely expressible.
+
+A lot of the difficulty in supporting higher-rank polymorphism is just dealing with the ensuing complexity in both type representation and substitution.
+Implementing higher-rank scope polymorphism would require solving some of these problems and therefore may make it easier in the future to support higher-rank polymorphism over types as well.
+There are some compelling use cases for such a feature; a recent example came up in [SE-0526][] for walking the active deadlines.
+However, there also arguments against it.
+Most importantly, it would become another code pattern where the compiler would often be unable to specialize generic code, which can be bad for performance.
+However, this performance concern does not apply to scope polymorphism because the scopes are erased at runtime.
 
 ### Flow-sensitive refinement of scope restrictions
 
@@ -1083,5 +1141,7 @@ SILGen therefore only needs to represent enough information in SIL to allow the 
 [SE-0446]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0446-non-escapable.md
 [SE-0516]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0516-borrowing-sequence.md
 [SE-0519]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0519-ref-mutableref-types.md
-[SSA]: https://en.wikipedia.org/wiki/Static_single-assignment_form
+[SE-0524]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0524-span-temporary-allocation.md
 [SE-0526]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0526-deadline.md
+
+[SSA]: https://en.wikipedia.org/wiki/Static_single-assignment_form
